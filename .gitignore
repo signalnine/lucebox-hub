@@ -68,3 +68,5 @@ checkpoints/
 .env.local
 *.pem
 *.key
+.dolt/
+*.db

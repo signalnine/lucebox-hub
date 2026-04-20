@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "lucebox_hub",
+  "project_id": "c85b3d1a-82eb-4c72-b949-652d5eadcb41"
+}
