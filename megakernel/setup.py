@@ -19,7 +19,7 @@ setup(
                     "--use_fast_math",
                     "-std=c++17",
                     "-DNUM_BLOCKS=170",
-                    "-DBLOCK_SIZE=512",
+                    "-DBLOCK_SIZE=1024",
                     "-DLM_NUM_BLOCKS=512",
                     "-DLM_BLOCK_SIZE=256",
                 ],
