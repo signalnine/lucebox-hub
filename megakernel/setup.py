@@ -15,10 +15,10 @@ setup(
                 "cxx": ["-O3"],
                 "nvcc": [
                     "-O3",
-                    "-arch=sm_86",
+                    "-arch=sm_120",
                     "--use_fast_math",
                     "-std=c++17",
-                    "-DNUM_BLOCKS=82",
+                    "-DNUM_BLOCKS=170",
                     "-DBLOCK_SIZE=512",
                     "-DLM_NUM_BLOCKS=512",
                     "-DLM_BLOCK_SIZE=256",
