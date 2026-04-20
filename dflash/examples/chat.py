@@ -77,7 +77,7 @@ def stream_generate(tok, bin_path: Path, target: Path, draft: Path,
 def main():
     if not BIN.is_file():
         sys.exit(f"binary not found at {BIN}. Build: "
-                 "cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=86 && "
+                 "cmake -B build -S . -DCMAKE_CUDA_ARCHITECTURES=120 && "
                  "cmake --build build --target test_dflash -j")
     if not TARGET.is_file():
         sys.exit(f"target GGUF not found at {TARGET}")

@@ -47,7 +47,7 @@ add_library(dflash27b STATIC
     src/f16_convert.cu
     src/delta_net_chunked.cpp
 )
-set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "86")
+set_target_properties(dflash27b PROPERTIES CUDA_ARCHITECTURES "120")
 
 target_include_directories(dflash27b
     PUBLIC
