@@ -1250,7 +1250,46 @@ int main(int argc, char ** argv) {
             ddtree_tree = build_ddtree(ddtree_logp.data(), ddtree_toks.data(),
                                        L_ddtree, ddtree_K, ddtree_budget, /*chain_seed=*/true);
             DDTree & tree = ddtree_tree;
-            const int N = 1 + tree.n_nodes;  // root + tree nodes
+            // Pad the tree to EXACTLY ddtree_budget non-root nodes so the
+            // graph's n_tokens (=1+budget) is constant across rounds. That
+            // constancy is what lets ggml-cuda reuse the captured CUDA graph
+            // via cudaGraphExecUpdate (same op sequence, same shapes; only
+            // tensor values change per step). Real trees with <budget nodes
+            // happen when the heap exhausts or the best-first search picks
+            // fewer siblings than allotted.
+            //
+            // Dummy leaves are parented at the root with a pad token_id (0).
+            // The visibility rebuild below ensures: (a) real queries can't
+            // see dummies (they weren't ancestors); (b) dummy queries only
+            // see root + self, so they produce well-defined (but discarded)
+            // output; (c) no NaN softmax rows.
+            while (tree.n_nodes < ddtree_budget) {
+                tree.token_ids.push_back(0);
+                tree.depths.push_back(0);
+                tree.parents.push_back(0);
+                tree.child_maps.emplace_back();
+                tree.n_nodes++;
+            }
+            // Rebuild visibility over the padded size. For real nodes this
+            // recreates the original ancestor chain; for dummies (parent=0)
+            // it sets visibility[dummy][0] and visibility[dummy][dummy].
+            // Crucially, visibility[real][dummy] stays 0 because the j<i
+            // loop never writes to j >= i; dummies are appended AFTER the
+            // real nodes so their indices are > real indices.
+            {
+                const int N = 1 + tree.n_nodes;
+                tree.visibility.assign((size_t)N * N, 0);
+                tree.visibility[0] = 1;  // root sees itself
+                for (int i = 1; i < N; i++) {
+                    const int p = tree.parents[i];
+                    for (int j = 0; j < i; j++) {
+                        tree.visibility[(size_t)i * N + j] =
+                            tree.visibility[(size_t)p * N + j];
+                    }
+                    tree.visibility[(size_t)i * N + i] = 1;
+                }
+            }
+            const int N = 1 + tree.n_nodes;  // root + tree nodes (= 1 + budget)
             // Flat tokens: slot 0 = root (= last_tok), slots 1..N-1 = tree nodes.
             std::vector<int32_t> flat_tokens(N);
             flat_tokens[0] = last_tok;
