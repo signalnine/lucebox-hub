@@ -72,9 +72,16 @@ struct StepGraph {
     // capture_delta_intermediate=true. Used by DDTree fast rollback.
     std::vector<dflash27b::DeltaNetCapture> delta_captures;
 };
+// Reset per-call graph state but KEEP the persistent sg.alloc (CUDA buffer)
+// AND sg.ctx across calls. ggml_reset rewinds the ctx's arena bump pointer
+// without freeing the underlying mem_buffer — so the next ggml_new_tensor_*
+// calls re-use the same addresses, keeping cgraph->nodes[0] pointer-stable.
+// That's what ggml-cuda's CUDA-graph cache keys on, and it's what turns
+// per-step kernel launches into a single captured graph launch under
+// GGML_CUDA_GRAPHS=ON. Freeing+reallocating sg.alloc also costs ~ms per
+// step at multi-GB working set, which is significant here.
 static void step_graph_free(StepGraph & sg) {
-    if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
-    if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
+    if (sg.ctx) ggml_reset(sg.ctx);
     sg.gf = nullptr;
     sg.inp_embed  = nullptr;
     sg.positions  = nullptr;
@@ -83,6 +90,12 @@ static void step_graph_free(StepGraph & sg) {
     sg.logits     = nullptr;
     sg.n_tokens   = 0;
     sg.delta_captures.clear();
+}
+// Called at shutdown — fully tear down.
+static void step_graph_destroy(StepGraph & sg) {
+    if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
+    if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
+    step_graph_free(sg);
 }
 
 // Flash-attn mask alignment (test_dflash convention: 32 on both axes).
@@ -304,10 +317,12 @@ static bool build_step_graph(
     int n_tokens)
 {
     step_graph_free(sg);
-    ggml_init_params ip{};
-    ip.mem_size = 512 * 1024 * 1024; ip.no_alloc = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
+    if (!sg.ctx) {
+        ggml_init_params ip{};
+        ip.mem_size = 512 * 1024 * 1024; ip.no_alloc = true;
+        sg.ctx = ggml_init(ip);
+        if (!sg.ctx) return false;
+    }
 
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
@@ -340,7 +355,9 @@ static bool build_step_graph(
     sg.logits   = go.logits;
     sg.n_tokens = n_tokens;
 
-    sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
@@ -356,10 +373,12 @@ static bool build_step_graph_tree(
     int n_tokens)
 {
     step_graph_free(sg);
-    ggml_init_params ip{};
-    ip.mem_size = 512 * 1024 * 1024; ip.no_alloc = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
+    if (!sg.ctx) {
+        ggml_init_params ip{};
+        ip.mem_size = 512 * 1024 * 1024; ip.no_alloc = true;
+        sg.ctx = ggml_init(ip);
+        if (!sg.ctx) return false;
+    }
 
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
@@ -396,7 +415,9 @@ static bool build_step_graph_tree(
     sg.delta_captures = std::move(go.delta_captures);
     sg.n_tokens       = n_tokens;
 
-    sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
@@ -925,7 +946,7 @@ int main(int argc, char ** argv) {
             for (int i = 0; i < 16; i++) out_try[i] = -1;
             verify_batch(w_tgt, c_tgt, backend, sg_try,
                          all_inputs, try_n, P, ebt, lbt, mbt, out_try);
-            step_graph_free(sg_try);
+            step_graph_destroy(sg_try);
             std::printf("[diag] batched N=%d:", try_n);
             for (int i = 0; i < try_n; i++)
                 std::printf(" %d%s", out_try[i], out_try[i] == seq_preds[i] ? "" : "!");
@@ -957,7 +978,7 @@ int main(int argc, char ** argv) {
         std::printf("[diag] batch #2: ");
         for (int i = 0; i < N; i++) std::printf("%d ", batch_preds2[i]);
         std::printf("\n");
-        step_graph_free(sg_batch);
+        step_graph_destroy(sg_batch);
         for (int i = 0; i < N; i++) batch_preds[i] = batch_preds2[i];
         std::printf("[diag] batch: ");
         for (int i = 0; i < N; i++) std::printf("%d ", batch_preds[i]);
@@ -1339,7 +1360,7 @@ int main(int argc, char ** argv) {
     all.insert(all.end(), gen.begin(), gen.end());
     write_int32_file(out_path, all);
 
-    step_graph_free(sg_tgt); step_graph_free(sg_drf);
+    step_graph_destroy(sg_tgt); step_graph_destroy(sg_drf);
     free_target_cache(c_tgt); free_target_cache(c_drf);
     free_target_weights(w_tgt); free_target_weights(w_drf);
     ggml_backend_free(backend);
