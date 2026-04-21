@@ -199,10 +199,14 @@ bool load_target_gguf(const std::string & path,
 
     bool hparams_ok = false;
     if (arch_tag == TARGET_ARCH_QWEN35) {
-        hparams_ok = (n_embd == 5120 && n_layer == 64 && n_head == 24 && n_headkv == 4 &&
-                      kl == 256 && vl == 256 && n_ff == 17408 && fai == 4 &&
-                      ssm_conv == 4 && ssm_inner == 6144 && ssm_state == 128 &&
-                      ssm_dt == 48 && ssm_grp == 16);
+        // Accept any qwen35 dense model whose hparams are self-consistent.
+        // Known targets: Qwen3.5-0.8B (n_embd=1024), Qwen3.5-27B (n_embd=5120).
+        // The graph builder is size-agnostic — it reads w.n_*, w.ssm_* at runtime.
+        hparams_ok = (n_embd > 0 && n_layer > 0 && n_head > 0 && n_headkv > 0 &&
+                      kl == 256 && vl == 256 && n_ff > 0 && fai == 4 &&
+                      ssm_conv == 4 && ssm_state == 128 && ssm_grp == 16 &&
+                      ssm_inner > 0 && ssm_dt > 0 &&
+                      ssm_inner % ssm_dt == 0);   // head_v_dim = inner/dt_rank must be integer
     } else { // qwen35moe
         hparams_ok = (n_embd == DFLASH36_TARGET_HIDDEN && n_layer == DFLASH36_TARGET_LAYERS &&
                       n_head == DFLASH36_TARGET_N_HEAD && n_headkv == DFLASH36_TARGET_N_HEAD_KV &&
@@ -276,11 +280,19 @@ bool load_target_gguf(const std::string & path,
     };
     out.tok_embd = g("token_embd.weight");
     out.out_norm = g("output_norm.weight");
-    out.output   = g("output.weight");
-    if (!out.tok_embd || !out.out_norm || !out.output) {
-        set_last_error("missing top-level tensors (token_embd/output_norm/output)");
+    out.output   = g("output.weight");     // may be missing (tied embedding)
+    if (!out.tok_embd || !out.out_norm) {
+        set_last_error("missing top-level tensors (token_embd/output_norm)");
         gguf_free(gctx);
         return false;
+    }
+    // Tied-embedding fallback (e.g. Qwen3.5-0.8B): share the token
+    // embedding tensor as the LM head. The GGUF has only one physical
+    // tensor for both; we treat it as both CPU-resident for embedding
+    // lookup AND GPU-resident for logits.
+    const bool tied_lm_head = (out.output == nullptr);
+    if (tied_lm_head) {
+        out.output = out.tok_embd;
     }
 
     for (int il = 0; il < (int)n_layer; il++) {
@@ -413,11 +425,15 @@ bool load_target_gguf(const std::string & path,
             return false;
         }
         if (std::string(tname) == "token_embd.weight") {
-            // Remember offset + size for the CPU embedder; don't upload to GPU.
+            // Always record for the CPU embedder.
             tok_embd_off  = off;
             tok_embd_sz   = sz;
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
-            continue;
+            // On tied-LM-head models, ALSO upload to GPU (the same tensor is
+            // used as the LM head via out.output aliasing out.tok_embd). On
+            // untied models (27B, 35B), skip GPU upload — the CpuEmbedder
+            // holds the only copy and LM head is a separate output.weight.
+            if (!tied_lm_head) continue;
         }
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
         total += sz;
