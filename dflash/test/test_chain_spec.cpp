@@ -62,12 +62,14 @@ struct StepGraph {
     ggml_context *    ctx   = nullptr;
     ggml_cgraph *     gf    = nullptr;
     ggml_gallocr_t    alloc = nullptr;
-    ggml_tensor *     inp_embed  = nullptr;
-    ggml_tensor *     positions  = nullptr;
-    ggml_tensor *     attn_mask  = nullptr;
-    ggml_tensor *     parent_ids = nullptr;   // tree-mode only
-    ggml_tensor *     logits     = nullptr;
-    int               n_tokens   = 0;
+    ggml_tensor *     inp_embed   = nullptr;
+    ggml_tensor *     positions   = nullptr;
+    ggml_tensor *     attn_mask   = nullptr;
+    ggml_tensor *     parent_ids  = nullptr;   // tree-mode only
+    ggml_tensor *     kv_pos_idx  = nullptr;   // i64 [n_tokens] for KV set_rows
+    ggml_tensor *     logits      = nullptr;
+    int               n_tokens    = 0;
+    int               n_kv_padded = 0;
     // Tree-mode only: one entry per delta-net layer. Populated when
     // capture_delta_intermediate=true. Used by DDTree fast rollback.
     std::vector<dflash27b::DeltaNetCapture> delta_captures;
@@ -83,12 +85,14 @@ struct StepGraph {
 static void step_graph_free(StepGraph & sg) {
     if (sg.ctx) ggml_reset(sg.ctx);
     sg.gf = nullptr;
-    sg.inp_embed  = nullptr;
-    sg.positions  = nullptr;
-    sg.attn_mask  = nullptr;
-    sg.parent_ids = nullptr;
-    sg.logits     = nullptr;
-    sg.n_tokens   = 0;
+    sg.inp_embed   = nullptr;
+    sg.positions   = nullptr;
+    sg.attn_mask   = nullptr;
+    sg.parent_ids  = nullptr;
+    sg.kv_pos_idx  = nullptr;
+    sg.logits      = nullptr;
+    sg.n_tokens    = 0;
+    sg.n_kv_padded = 0;
     sg.delta_captures.clear();
 }
 // Called at shutdown — fully tear down.
@@ -109,16 +113,31 @@ static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
 
+// Build a causal mask padded to `kv_pad_override` on the K axis (caller
+// usually passes sg.n_kv_padded so the view shape stays stable for CUDA
+// graph reuse). Pad q rows duplicate the last real row's mask pattern so
+// fattn never sees an all-(-inf) softmax row.
 static void build_causal_mask_f16(
-    std::vector<uint16_t> & out, int kv_len, int n_tokens, int kv_start)
+    std::vector<uint16_t> & out, int kv_len, int n_tokens, int kv_start,
+    int kv_pad_override = -1)
 {
-    const int kv_pad = align_up(kv_len,  KQ_STRIDE_PAD);
+    const int kv_pad = (kv_pad_override > 0)
+        ? kv_pad_override
+        : align_up(kv_len, KQ_STRIDE_PAD);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < n_tokens; q++) {
         const int max_k = kv_start + q;
-        for (int k = 0; k <= max_k && k < kv_len; k++) {
+        for (int k = 0; k <= max_k && k < kv_pad; k++) {
             out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+    }
+    // Pad q rows: copy last real row's pattern.
+    if (n_tokens < q_pad && n_tokens > 0) {
+        for (int q = n_tokens; q < q_pad; q++) {
+            std::memcpy(&out[(size_t)q * kv_pad],
+                        &out[(size_t)(n_tokens - 1) * kv_pad],
+                        sizeof(uint16_t) * kv_pad);
         }
     }
 }
@@ -287,20 +306,30 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
 
 // Build f16 ancestor-only attention mask.
 static void build_tree_mask(const DDTree & tree, int past_length,
-                            std::vector<uint16_t> & out_mask) {
+                            std::vector<uint16_t> & out_mask,
+                            int kv_pad_override = -1) {
     const int N      = 1 + tree.n_nodes;
     const int kv_len = past_length + N;
-    const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
-    const int q_pad  = align_up(N,      KQ_MASK_PAD);
+    const int kv_pad = (kv_pad_override > 0)
+        ? kv_pad_override
+        : align_up(kv_len, KQ_STRIDE_PAD);
+    const int q_pad  = align_up(N, KQ_MASK_PAD);
     out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < N; q++) {
-        for (int k = 0; k < past_length; k++) {
+        for (int k = 0; k < past_length && k < kv_pad; k++) {
             out_mask[(size_t)q * kv_pad + k] = F16_ZERO;
         }
         for (int j = 0; j < N; j++) {
-            if (tree.visibility[(size_t)q * N + j]) {
+            if (tree.visibility[(size_t)q * N + j] && past_length + j < kv_pad) {
                 out_mask[(size_t)q * kv_pad + (past_length + j)] = F16_ZERO;
             }
+        }
+    }
+    if (N < q_pad && N > 0) {
+        for (int q = N; q < q_pad; q++) {
+            std::memcpy(&out_mask[(size_t)q * kv_pad],
+                        &out_mask[(size_t)(N - 1) * kv_pad],
+                        sizeof(uint16_t) * kv_pad);
         }
     }
 }
@@ -330,22 +359,31 @@ static bool build_step_graph(
     ggml_set_input(sg.inp_embed);
     ggml_set_input(sg.positions);
 
-    if (n_tokens > 1) {
-        const int kv_len = kv_start + n_tokens;
-        const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
-        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-        ggml_set_input(sg.attn_mask);
-    }
+    // KV write indices + always-on f16 mask (see test_generate for the
+    // rationale — 256-aligned n_kv_padded keeps the read view shape stable
+    // across 256 steps, which is what ggml-cuda needs to reuse the captured
+    // CUDA graph). q_pad matches KQ_MASK_PAD=32 for the fattn padded-q
+    // convention.
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len     = kv_start + n_tokens;
+    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int q_pad      = align_up(n_tokens, KQ_MASK_PAD);
+    sg.attn_mask  = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
+    ggml_set_input(sg.attn_mask);
+    sg.kv_pos_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_input(sg.kv_pos_idx);
+    sg.n_kv_padded = n_kv_padded;
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
     QwenGraphInputs gi{};
-    gi.inp_embed = sg.inp_embed;
-    gi.positions = sg.positions;
-    gi.attn_mask = sg.attn_mask;   // nullptr for n_tokens==1
-    gi.n_tokens  = n_tokens;
-    gi.kv_start  = kv_start;
+    gi.inp_embed    = sg.inp_embed;
+    gi.positions    = sg.positions;
+    gi.attn_mask    = sg.attn_mask;
+    gi.kv_pos_idx   = sg.kv_pos_idx;
+    gi.n_kv_padded  = n_kv_padded;
+    gi.n_tokens     = n_tokens;
+    gi.kv_start     = kv_start;
     gi.capture_layers = false;
 
     QwenGraphOutputs go = build_target_graph(sg.ctx, sg.gf, w, cache, gi);
@@ -386,11 +424,15 @@ static bool build_step_graph_tree(
     ggml_set_input(sg.inp_embed);
     ggml_set_input(sg.positions);
 
-    const int kv_len = kv_start + n_tokens;
-    const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
-    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len      = kv_start + n_tokens;
+    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int q_pad       = align_up(n_tokens, KQ_MASK_PAD);
+    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
     ggml_set_input(sg.attn_mask);
+    sg.kv_pos_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_input(sg.kv_pos_idx);
+    sg.n_kv_padded = n_kv_padded;
 
     sg.parent_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_input(sg.parent_ids);
@@ -401,6 +443,8 @@ static bool build_step_graph_tree(
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
+    gi.kv_pos_idx                 = sg.kv_pos_idx;
+    gi.n_kv_padded                = n_kv_padded;
     gi.n_tokens                   = n_tokens;
     gi.kv_start                   = kv_start;
     gi.capture_layers             = false;
@@ -447,6 +491,20 @@ static int32_t step_model(
     ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0, sizeof(float) * hidden);
     int32_t p4[4] = { pos, pos, pos, pos };
     ggml_backend_tensor_set(sg.positions, p4, 0, sizeof(int32_t) * 4);
+    // KV write row index + full causal mask (see build_step_graph).
+    int64_t kv_idx[1] = { (int64_t)pos };
+    ggml_backend_tensor_set(sg.kv_pos_idx, kv_idx, 0, sizeof(int64_t));
+    {
+        const int kv_len = pos + 1;
+        const int q_pad  = align_up(1, KQ_MASK_PAD);
+        std::vector<uint16_t> mask((size_t)sg.n_kv_padded * q_pad, F16_NEG_INF);
+        for (int q = 0; q < q_pad; q++) {
+            for (int k = 0; k < kv_len && k < sg.n_kv_padded; k++) {
+                mask[q * sg.n_kv_padded + k] = F16_ZERO;
+            }
+        }
+        ggml_backend_tensor_set(sg.attn_mask, mask.data(), 0, sizeof(uint16_t) * mask.size());
+    }
     if (ggml_backend_graph_compute(backend, sg.gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "compute failed at pos=%d\n", pos); std::exit(1);
     }
@@ -500,10 +558,32 @@ static void verify_batch(
     ggml_backend_tensor_set(sg.positions, positions.data(), 0,
                             sizeof(int32_t) * positions.size());
 
-    // Causal mask (only created for n_tokens > 1 — single-token needs none).
-    if (sg.attn_mask) {
+    // KV write indices: pos..pos+n_tokens-1.
+    std::vector<int64_t> kv_idxs(n_tokens);
+    for (int i = 0; i < n_tokens; i++) kv_idxs[i] = (int64_t)(pos + i);
+    ggml_backend_tensor_set(sg.kv_pos_idx, kv_idxs.data(), 0,
+                            sizeof(int64_t) * kv_idxs.size());
+
+    // Causal mask padded to n_kv_padded (256-aligned) so the read view shape
+    // stays stable across 256 steps for CUDA-graph reuse.
+    {
         const int kv_len = pos + n_tokens;
-        build_causal_mask_f16(mask_buf, kv_len, n_tokens, pos);
+        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+        mask_buf.assign((size_t)sg.n_kv_padded * q_pad, F16_NEG_INF);
+        for (int q = 0; q < n_tokens; q++) {
+            const int max_k = pos + q;
+            for (int k = 0; k <= max_k && k < sg.n_kv_padded; k++) {
+                mask_buf[(size_t)q * sg.n_kv_padded + k] = F16_ZERO;
+            }
+        }
+        // Pad q rows: duplicate the last real row's pattern so softmax
+        // doesn't see an all-(-inf) row (NaN guard).
+        for (int q = n_tokens; q < q_pad; q++) {
+            const int max_k = pos + (n_tokens - 1);
+            for (int k = 0; k <= max_k && k < sg.n_kv_padded; k++) {
+                mask_buf[(size_t)q * sg.n_kv_padded + k] = F16_ZERO;
+            }
+        }
         ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                 sizeof(uint16_t) * mask_buf.size());
     }
@@ -591,10 +671,16 @@ static void verify_tree(
     ggml_backend_tensor_set(sg.positions, positions_in, 0, sizeof(int32_t) * 4 * n_tokens);
     ggml_backend_tensor_set(sg.parent_ids, parent_ids_in, 0, sizeof(int32_t) * n_tokens);
 
-    const int kv_len = kv_start + n_tokens;
-    const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
-    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-    ggml_backend_tensor_set(sg.attn_mask, mask_in, 0, sizeof(uint16_t) * kv_pad * q_pad);
+    // Caller's mask is expected to be padded to sg.n_kv_padded on the K axis.
+    const int q_pad = align_up(n_tokens, KQ_MASK_PAD);
+    ggml_backend_tensor_set(sg.attn_mask, mask_in, 0,
+                            sizeof(uint16_t) * sg.n_kv_padded * q_pad);
+
+    // KV write indices = sequential slots [kv_start..kv_start+n_tokens-1].
+    std::vector<int64_t> kv_idxs(n_tokens);
+    for (int i = 0; i < n_tokens; i++) kv_idxs[i] = (int64_t)(kv_start + i);
+    ggml_backend_tensor_set(sg.kv_pos_idx, kv_idxs.data(), 0,
+                            sizeof(int64_t) * kv_idxs.size());
 
     if (ggml_backend_graph_compute(backend, sg.gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "tree compute failed\n"); std::exit(1);
@@ -1142,7 +1228,8 @@ int main(int argc, char ** argv) {
                 tree_positions[3 * N_spec + i] = 0;
             }
             const int kv_len = pre_pos + N_spec;
-            build_causal_mask_f16(mask_buf, kv_len, N_spec, pre_pos);
+            const int n_kv_padded = ((kv_len + 255) / 256) * 256;
+            build_causal_mask_f16(mask_buf, kv_len, N_spec, pre_pos, n_kv_padded);
             verify_tree(w_tgt, c_tgt, backend, sg_tgt,
                         verify_in.data(), parent_ids.data(),
                         tree_positions.data(), mask_buf.data(),
@@ -1177,8 +1264,11 @@ int main(int argc, char ** argv) {
                 pos4[2 * N + i] = p;
                 pos4[3 * N + i] = 0;
             }
-            // Ancestor-only mask.
-            build_tree_mask(tree, pre_pos, mask_buf);
+            // Ancestor-only mask, padded to 256-aligned n_kv_padded so
+            // the K-read view shape stays stable for CUDA-graph reuse.
+            const int tree_kv_len    = pre_pos + N;
+            const int tree_kv_padded = ((tree_kv_len + 255) / 256) * 256;
+            build_tree_mask(tree, pre_pos, mask_buf, tree_kv_padded);
             // parent_ids (slot 0 = -1 root sentinel).
             std::vector<int32_t> parent_ids_tree(N);
             parent_ids_tree[0] = -1;
