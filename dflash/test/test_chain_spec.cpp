@@ -52,18 +52,23 @@ struct StepGraph {
     ggml_context *    ctx   = nullptr;
     ggml_cgraph *     gf    = nullptr;
     ggml_gallocr_t    alloc = nullptr;
-    ggml_tensor *     inp_embed = nullptr;
-    ggml_tensor *     positions = nullptr;
-    ggml_tensor *     attn_mask = nullptr;
-    ggml_tensor *     logits    = nullptr;
-    int               n_tokens  = 0;
+    ggml_tensor *     inp_embed  = nullptr;
+    ggml_tensor *     positions  = nullptr;
+    ggml_tensor *     attn_mask  = nullptr;
+    ggml_tensor *     parent_ids = nullptr;   // tree-mode only
+    ggml_tensor *     logits     = nullptr;
+    int               n_tokens   = 0;
 };
 static void step_graph_free(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
-    sg.gf = nullptr; sg.inp_embed = nullptr;
-    sg.positions = nullptr; sg.attn_mask = nullptr;
-    sg.logits = nullptr; sg.n_tokens = 0;
+    sg.gf = nullptr;
+    sg.inp_embed  = nullptr;
+    sg.positions  = nullptr;
+    sg.attn_mask  = nullptr;
+    sg.parent_ids = nullptr;
+    sg.logits     = nullptr;
+    sg.n_tokens   = 0;
 }
 
 // Flash-attn mask alignment (test_dflash convention: 32 on both axes).
@@ -131,6 +136,61 @@ static bool build_step_graph(
     gi.n_tokens  = n_tokens;
     gi.kv_start  = kv_start;
     gi.capture_layers = false;
+
+    QwenGraphOutputs go = build_target_graph(sg.ctx, sg.gf, w, cache, gi);
+    if (!go.logits) return false;
+    ggml_set_output(go.logits);
+    ggml_build_forward_expand(sg.gf, go.logits);
+    sg.logits   = go.logits;
+    sg.n_tokens = n_tokens;
+
+    sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
+}
+
+// Tree-mode graph: like the batched graph but with a parent_ids input wired
+// to the DeltaNet kernel AND capture_delta_intermediate=true so SSM rollback
+// doesn't need replay. Matches test_dflash::build_target_step_tree structure.
+static bool build_step_graph_tree(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int kv_start,
+    int n_tokens)
+{
+    step_graph_free(sg);
+    ggml_init_params ip{};
+    ip.mem_size = 512 * 1024 * 1024; ip.no_alloc = true;
+    sg.ctx = ggml_init(ip);
+    if (!sg.ctx) return false;
+
+    const int hidden = w.n_embd;
+    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
+    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
+    ggml_set_input(sg.inp_embed);
+    ggml_set_input(sg.positions);
+
+    const int kv_len = kv_start + n_tokens;
+    const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
+    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    ggml_set_input(sg.attn_mask);
+
+    sg.parent_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(sg.parent_ids);
+
+    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
+
+    QwenGraphInputs gi{};
+    gi.inp_embed                  = sg.inp_embed;
+    gi.positions                  = sg.positions;
+    gi.attn_mask                  = sg.attn_mask;
+    gi.n_tokens                   = n_tokens;
+    gi.kv_start                   = kv_start;
+    gi.capture_layers             = false;
+    gi.capture_delta_intermediate = true;
+    gi.parent_ids                 = sg.parent_ids;
 
     QwenGraphOutputs go = build_target_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
@@ -275,6 +335,66 @@ static void verify_batch(
     }
 }
 
+// Tree-mode batched forward. Like verify_batch but:
+//   - builds graph with parent_ids + capture_delta_intermediate (tree-mode
+//     DeltaNet kernel)
+//   - caller supplies parent_ids[n_tokens]; linear chain is [-1, 0, 1, ..., N-2]
+//     (GGML_GDN_TREE_ROOT_PARENT = -1 for the first token, else sequential)
+//   - positions can be ABSOLUTE per-token depth offsets (for real trees) or
+//     linear [pos, pos+1, ..., pos+N-1] (for chain DDTree)
+//   - mask can be causal (linear chain) or ancestor-only (real tree)
+//
+// Returns N argmax predictions in argmax_out.
+static void verify_tree(
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    StepGraph & sg,
+    const int32_t * toks,
+    const int32_t * parent_ids_in,
+    const int32_t * positions_in,  // 4*n_tokens, axis-major layout
+    const uint16_t * mask_in,      // kv_pad * q_pad, f16 bits
+    int n_tokens, int kv_start,
+    std::vector<float> & embed_buf,
+    std::vector<float> & logits_buf,
+    int32_t * argmax_out)
+{
+    if (!build_step_graph_tree(sg, w, cache, backend, kv_start, n_tokens)) {
+        std::fprintf(stderr, "build_step_graph_tree(%d) failed at pos=%d\n", n_tokens, kv_start);
+        std::exit(1);
+    }
+    const int hidden = w.n_embd;
+    if ((int)embed_buf.size() < hidden * n_tokens) embed_buf.assign(hidden * n_tokens, 0.f);
+    if (!w.embedder.embed(toks, n_tokens, embed_buf.data())) {
+        std::fprintf(stderr, "tree embed failed\n"); std::exit(1);
+    }
+    ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0,
+                            sizeof(float) * hidden * n_tokens);
+    ggml_backend_tensor_set(sg.positions, positions_in, 0, sizeof(int32_t) * 4 * n_tokens);
+    ggml_backend_tensor_set(sg.parent_ids, parent_ids_in, 0, sizeof(int32_t) * n_tokens);
+
+    const int kv_len = kv_start + n_tokens;
+    const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
+    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
+    ggml_backend_tensor_set(sg.attn_mask, mask_in, 0, sizeof(uint16_t) * kv_pad * q_pad);
+
+    if (ggml_backend_graph_compute(backend, sg.gf) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "tree compute failed\n"); std::exit(1);
+    }
+    const int vocab = (int)w.embedder.n_vocab;
+    if (logits_buf.size() < (size_t)vocab * n_tokens)
+        logits_buf.assign((size_t)vocab * n_tokens, 0.f);
+    ggml_backend_tensor_get(sg.logits, logits_buf.data(), 0,
+                            sizeof(float) * vocab * n_tokens);
+    for (int i = 0; i < n_tokens; i++) {
+        const float * row = logits_buf.data() + (size_t)i * vocab;
+        int best = 0; float bv = row[0];
+        for (int k = 1; k < vocab; k++)
+            if (row[k] > bv) { bv = row[k]; best = k; }
+        argmax_out[i] = best;
+    }
+}
+
 int main(int argc, char ** argv) {
     if (argc < 7) {
         std::fprintf(stderr,
@@ -291,26 +411,29 @@ int main(int argc, char ** argv) {
     if (N_spec < 1 || N_spec > 64) { std::fprintf(stderr, "N_spec out of range\n"); return 1; }
 
     // Verify mode:
-    //   CHAIN_VERIFY=seq     → sequential single-token target verify, byte-
-    //                          identical to AR but slower (~50 tok/s)
-    //   CHAIN_VERIFY=batch   → batched N-token target verify, faster
-    //                          (~135-165 tok/s on 35B) but MMA_F16 fp16
-    //                          accumulation resolves near-tie argmax
-    //                          differently than VEC fp32 (sequential path).
-    //                          Target's greedy output drifts toward what
-    //                          the fp16-rounded target prefers, which on
-    //                          this prompt happens to agree with draft more
-    //                          often → higher acceptance, faster, but the
-    //                          committed text loops ("Paris. The capital of
-    //                          France is Paris.") instead of continuing
-    //                          ("Paris, a city renowned..."). Use batch only
-    //                          when ~2% per-position accept-rate drift is
-    //                          acceptable for a 1.3× throughput gain.
+    //   CHAIN_VERIFY=seq          sequential single-token target verify,
+    //                             byte-identical to AR but slow (~50 tok/s)
+    //   CHAIN_VERIFY=batch        batched N-token verify via plain
+    //                             ggml_gated_delta_net. Fast (~140 tok/s at
+    //                             N=16) but fp16 MMA accumulation resolves
+    //                             near-tie argmax differently than VEC fp32
+    //                             (see M2b notes).
+    //   CHAIN_VERIFY=tree_chain   batched N-token verify via the tree-mode
+    //                             kernel (ggml_gated_delta_net_tree_persist)
+    //                             with linear parent_ids. Same op structure
+    //                             as real DDTree but no branching. Tests
+    //                             whether the tree kernel has different
+    //                             numerics than the plain batched kernel.
     // Default = seq (lossless).
-    bool use_batched_verify = false;
+    enum VerifyMode { VERIFY_SEQ, VERIFY_BATCH, VERIFY_TREE_CHAIN };
+    VerifyMode verify_mode = VERIFY_SEQ;
     if (const char * s = std::getenv("CHAIN_VERIFY")) {
-        if (std::string(s) == "batch") use_batched_verify = true;
+        std::string m = s;
+        if      (m == "batch")      verify_mode = VERIFY_BATCH;
+        else if (m == "tree_chain") verify_mode = VERIFY_TREE_CHAIN;
     }
+    const bool use_batched_verify =
+        (verify_mode == VERIFY_BATCH || verify_mode == VERIFY_TREE_CHAIN);
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -330,7 +453,11 @@ int main(int argc, char ** argv) {
 
     const int max_ctx = 4096;
     TargetCache c_tgt, c_drf;
-    if (!create_target_cache(w_tgt, max_ctx, 0, backend, c_tgt)) {
+    // Size the target's verify-capture tensors (ssm_intermediate, conv_input_cache)
+    // to match N_spec exactly. The conv_input capture cpy asserts that the in-graph
+    // conv_input (shape [(kern-1)+N_spec, ch, 1]) has the same number of elements as
+    // the cache tensor — so this must be N_spec, not a larger default.
+    if (!create_target_cache(w_tgt, max_ctx, N_spec, backend, c_tgt)) {
         std::fprintf(stderr, "tgt cache: %s\n", dflash27b_last_error()); return 1;
     }
     if (!create_target_cache(w_drf, max_ctx, 0, backend, c_drf)) {
@@ -541,16 +668,44 @@ int main(int argc, char ** argv) {
         }
         n_drafted += N_spec;
 
-        // 2. Target verify — either batched (fast, near-tie drift) or
-        //    sequential (slower, byte-identical to AR).
+        // 2. Target verify — one of three modes.
         int k = 0;
         int32_t t_pred = -1;
-        if (use_batched_verify) {
+        if (verify_mode == VERIFY_BATCH) {
             verify_in[0] = last_tok;
             for (int i = 1; i < N_spec; i++) verify_in[i] = drafts[i - 1];
             verify_batch(w_tgt, c_tgt, backend, sg_tgt,
                          verify_in.data(), N_spec, pre_pos,
                          embed_tgt, logits_tgt, mask_buf, verify_out.data());
+            c_tgt.cur_pos = pre_pos + N_spec;
+            for (int i = 0; i < N_spec; i++) {
+                if (verify_out[i] == drafts[i]) k++;
+                else break;
+            }
+            t_pred = verify_out[k < N_spec ? k : N_spec - 1];
+        } else if (verify_mode == VERIFY_TREE_CHAIN) {
+            // Linear chain via tree-mode kernel. parent_ids[0]=-1 (root
+            // parent sentinel), parent_ids[i]=i-1 (sequential for i>0).
+            // Positions are linear like batched; mask is standard causal.
+            verify_in[0] = last_tok;
+            for (int i = 1; i < N_spec; i++) verify_in[i] = drafts[i - 1];
+            std::vector<int32_t> parent_ids(N_spec);
+            parent_ids[0] = -1;  // GGML_GDN_TREE_ROOT_PARENT
+            for (int i = 1; i < N_spec; i++) parent_ids[i] = i - 1;
+            std::vector<int32_t> tree_positions(4 * N_spec);
+            for (int i = 0; i < N_spec; i++) {
+                tree_positions[0 * N_spec + i] = pre_pos + i;
+                tree_positions[1 * N_spec + i] = pre_pos + i;
+                tree_positions[2 * N_spec + i] = pre_pos + i;
+                tree_positions[3 * N_spec + i] = 0;
+            }
+            const int kv_len = pre_pos + N_spec;
+            build_causal_mask_f16(mask_buf, kv_len, N_spec, pre_pos);
+            verify_tree(w_tgt, c_tgt, backend, sg_tgt,
+                        verify_in.data(), parent_ids.data(),
+                        tree_positions.data(), mask_buf.data(),
+                        N_spec, pre_pos,
+                        embed_tgt, logits_tgt, verify_out.data());
             c_tgt.cur_pos = pre_pos + N_spec;
             for (int i = 0; i < N_spec; i++) {
                 if (verify_out[i] == drafts[i]) k++;
