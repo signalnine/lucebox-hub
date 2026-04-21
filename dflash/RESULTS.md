@@ -245,6 +245,18 @@ The M1b port baseline was 125 tok/s (60% of llama.cpp). Three commits closed the
 
 3. **KV cache layout + `ggml_set_rows`** (`4c16107`) — switch cache from `[head_dim, max_ctx, n_head_kv]` to llama.cpp's `[n_embd_gqa, max_ctx]`, replace view-offset KV writes with `ggml_set_rows(cache, k_cur, kv_pos_idx)` where `kv_pos_idx` is an input tensor, and pad `n_kv` to `GGML_PAD(kv_len, 256)`. Graph shape is now stable across 256-step windows so ggml-cuda's 2-step `warmup_complete` latches and subsequent steps become single `cudaGraphLaunch` calls. Kernel instance count per step: Q8_0 mmvq from 7437/37steps pre-refactor to **121/37steps post-refactor** (~1 capture amortised over 36 graph launches). `compute=6208→4252 µs/step` (−31%).
 
+### Batched prefill (PREFILL_CHUNK=1024)
+
+The initial M1b implementation prefilled one prompt token per target forward. Commits `140215f`+`7ed0b6d` chunk the prompt into N-token forwards:
+
+| Prompt length | Ours prefill | llama-bench reference | Ratio |
+|---------------|:------------:|:---------------------:|:-----:|
+|  512 tokens   |  2811 tok/s  |  6487 (pp512)         | 43%   |
+| 1024 tokens   |  4012 tok/s  |  —                    | —     |
+| 2048 tokens   |  **4687 tok/s** |  6457 (pp2048)     | **72%** |
+
+Was 285 tok/s at M1b. The 1024-token chunk size amortises the per-chunk CUDA-graph capture over multiple kernel launches; each chunk's `mul_mat_q` tile utilises the MMQ batch path which is much faster per-token than the N=1 MMVQ kernel used during decode. Decode throughput is unaffected (prefill and decode use different CUDA graph cache slots, each with its own capture). Remaining prefill gap to llama.cpp is in upstream ggml-cuda (MMQ tile tuning; potential fused QKV for full-attn layers if the Q/K/V weights were pre-packed as they are on the 27B gguf).
+
 ### Spec-decode on HumanEval + GSM8K (n=5, n_gen=256, N_spec=8)
 
 With the 0.8B dense draft:
