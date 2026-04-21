@@ -102,14 +102,25 @@ static constexpr uint16_t F16_ZERO = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
 static void build_causal_mask(std::vector<uint16_t> & out,
-                              int kv_len, int n_tokens, int kv_start) {
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
+                              int kv_len, int n_tokens, int kv_start,
+                              int kv_pad_override = -1) {
+    const int kv_pad = (kv_pad_override > 0)
+        ? kv_pad_override
+        : align_up(kv_len, g_kq_stride_pad);
     const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
     out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < n_tokens; q++) {
         const int max_k = kv_start + q;
-        for (int k = 0; k <= max_k && k < kv_len; k++) {
+        for (int k = 0; k <= max_k && k < kv_pad; k++) {
             out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+    }
+    // Pad q rows: duplicate last real row to avoid all-(-inf) softmax rows.
+    if (n_tokens > 0 && n_tokens < q_pad) {
+        for (int q = n_tokens; q < q_pad; q++) {
+            std::memcpy(&out[(size_t)q * kv_pad],
+                        &out[(size_t)(n_tokens - 1) * kv_pad],
+                        sizeof(uint16_t) * kv_pad);
         }
     }
 }
@@ -406,22 +417,33 @@ static std::vector<int> follow_verified_tree(const DDTree & tree,
 //                                     = -inf otherwise
 // Shape matches the ggml flash_attn_ext expectation: [kv_pad, q_pad] f16.
 static void build_tree_mask(const DDTree & tree, int past_length,
-                            std::vector<uint16_t> & out_mask) {
+                            std::vector<uint16_t> & out_mask,
+                            int kv_pad_override = -1) {
     const int N      = 1 + tree.n_nodes;
     const int kv_len = past_length + N;
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
-    const int q_pad  = align_up(N,      KQ_MASK_PAD);
+    const int kv_pad = (kv_pad_override > 0)
+        ? kv_pad_override
+        : align_up(kv_len, g_kq_stride_pad);
+    const int q_pad  = align_up(N, KQ_MASK_PAD);
     out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
     for (int q = 0; q < N; q++) {
         // Past KV (prompt + previously-committed decode tokens): always visible.
-        for (int k = 0; k < past_length; k++) {
+        for (int k = 0; k < past_length && k < kv_pad; k++) {
             out_mask[(size_t)q * kv_pad + k] = F16_ZERO;
         }
         // Tree region: ancestors-only per the tree.visibility matrix.
         for (int j = 0; j < N; j++) {
-            if (tree.visibility[(size_t)q * N + j]) {
+            if (tree.visibility[(size_t)q * N + j] && past_length + j < kv_pad) {
                 out_mask[(size_t)q * kv_pad + (past_length + j)] = F16_ZERO;
             }
+        }
+    }
+    // Pad q rows: duplicate last real row (NaN guard).
+    if (N > 0 && N < q_pad) {
+        for (int q = N; q < q_pad; q++) {
+            std::memcpy(&out_mask[(size_t)q * kv_pad],
+                        &out_mask[(size_t)(N - 1) * kv_pad],
+                        sizeof(uint16_t) * kv_pad);
         }
     }
 }
@@ -438,8 +460,10 @@ struct StepGraph {
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
+    ggml_tensor *   kv_pos_idx = nullptr;    // i64 [n_tokens] — KV set_rows indices
     ggml_tensor *   target_hidden_cat = nullptr;  // draft only
     ggml_tensor *   positions_k = nullptr;        // draft only
+    int             n_kv_padded = 0;
 
     // Output
     ggml_tensor *   logits = nullptr;
@@ -466,7 +490,9 @@ static void step_graph_free(StepGraph & sg) {
     sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.parent_ids = nullptr;
+    sg.kv_pos_idx = nullptr;
     sg.logits = nullptr;
+    sg.n_kv_padded = 0;
     sg.delta_captures.clear();
 }
 
@@ -530,14 +556,24 @@ static bool build_target_step(
     ggml_set_name(sg.positions, "positions");
     ggml_set_input(sg.positions);
 
-    if (with_mask) {
-        const int kv_len = kv_start + n_tokens;
-        const int kv_pad = align_up(kv_len, g_kq_stride_pad);
-        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-        ggml_set_name(sg.attn_mask, "attn_mask");
-        ggml_set_input(sg.attn_mask);
-    }
+    // K/V writes go through ggml_set_rows now (required by the cache-layout
+    // refactor). The read view is sized to a 256-padded n_kv so the graph
+    // shape stays stable across decode steps — enables CUDA-graph reuse.
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len      = kv_start + n_tokens;
+    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+
+    const int q_pad = align_up(n_tokens, KQ_MASK_PAD);
+    // Always allocate the mask at the padded n_kv size, even if the caller
+    // didn't want a custom mask — we fill it causal by default below.
+    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
+    ggml_set_name(sg.attn_mask, "attn_mask");
+    ggml_set_input(sg.attn_mask);
+
+    sg.kv_pos_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_name(sg.kv_pos_idx, "kv_pos_idx");
+    ggml_set_input(sg.kv_pos_idx);
+    sg.n_kv_padded = n_kv_padded;
 
     sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
 
@@ -545,6 +581,8 @@ static bool build_target_step(
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
+    gi.kv_pos_idx                 = sg.kv_pos_idx;
+    gi.n_kv_padded                = n_kv_padded;
     gi.n_tokens                   = n_tokens;
     gi.kv_start                   = kv_start;
     gi.capture_layers             = capture;
@@ -596,12 +634,18 @@ static bool build_target_step_tree(
     ggml_set_name(sg.positions, "positions");
     ggml_set_input(sg.positions);
 
-    const int kv_len = kv_start + n_tokens;
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
-    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len      = kv_start + n_tokens;
+    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int q_pad       = align_up(n_tokens, KQ_MASK_PAD);
+    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
     ggml_set_name(sg.attn_mask, "attn_mask");
     ggml_set_input(sg.attn_mask);
+
+    sg.kv_pos_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_name(sg.kv_pos_idx, "kv_pos_idx");
+    ggml_set_input(sg.kv_pos_idx);
+    sg.n_kv_padded = n_kv_padded;
 
     // parent_ids[n_tokens] i32 — tree-mode DeltaNet input. -1 = reload from
     // pre-block state, k = reload from intermediate[k], t-1 = sequential (hot path).
@@ -615,6 +659,8 @@ static bool build_target_step_tree(
     gi.inp_embed                  = sg.inp_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
+    gi.kv_pos_idx                 = sg.kv_pos_idx;
+    gi.n_kv_padded                = n_kv_padded;
     gi.n_tokens                   = n_tokens;
     gi.kv_start                   = kv_start;
     gi.capture_layers             = true;
@@ -835,6 +881,12 @@ int main(int argc, char ** argv) {
                 pos4[3 * n + i] = 0;
             }
             ggml_backend_tensor_set(psg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * n);
+
+            std::vector<int64_t> kv_idxs_p(n);
+            for (int i = 0; i < n; i++) kv_idxs_p[i] = (int64_t)i;
+            ggml_backend_tensor_set(psg.kv_pos_idx, kv_idxs_p.data(), 0,
+                                    sizeof(int64_t) * kv_idxs_p.size());
+
             if (psg.attn_mask) {
                 const int kv_pad = (int)psg.attn_mask->ne[0];
                 const int q_pad  = (int)psg.attn_mask->ne[1];
@@ -842,6 +894,14 @@ int main(int argc, char ** argv) {
                 for (int q = 0; q < n; q++) {
                     for (int k = 0; k <= q; k++) {
                         mask_buf_p[(size_t)q * kv_pad + k] = F16_ZERO;
+                    }
+                }
+                // Pad q rows: duplicate last valid row (NaN guard).
+                if (n > 0 && n < q_pad) {
+                    for (int q = n; q < q_pad; q++) {
+                        std::memcpy(&mask_buf_p[(size_t)q * kv_pad],
+                                    &mask_buf_p[(size_t)(n - 1) * kv_pad],
+                                    sizeof(uint16_t) * kv_pad);
                     }
                 }
                 ggml_backend_tensor_set(psg.attn_mask, mask_buf_p.data(), 0,
@@ -949,14 +1009,18 @@ int main(int argc, char ** argv) {
         ggml_backend_tensor_set(sg.positions, pf_pos_buf.data(), 0,
                                 sizeof(int32_t) * pf_pos_buf.size());
 
-        // Causal mask required when n_tokens > 1 OR when the TBQ FA kernel
-        // is active (which pads kv_len to 256 and needs -inf on the padding
-        // positions even for a single query).
-        if (pf_with_mask) {
-            build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/start);
-            ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
-                                    sizeof(uint16_t) * pf_mask_buf.size());
-        }
+        // KV write indices — sequential slots start..start+n_tokens-1.
+        std::vector<int64_t> pf_kv_idxs(n_tokens);
+        for (int i = 0; i < n_tokens; i++) pf_kv_idxs[i] = (int64_t)(start + i);
+        ggml_backend_tensor_set(sg.kv_pos_idx, pf_kv_idxs.data(), 0,
+                                sizeof(int64_t) * pf_kv_idxs.size());
+
+        // Causal mask padded to sg.n_kv_padded (256-aligned) — the cache read
+        // view's shape matches this so CUDA graphs can reuse across steps.
+        build_causal_mask(pf_mask_buf, kv_len, n_tokens, /*kv_start=*/start,
+                          /*kv_pad_override=*/sg.n_kv_padded);
+        ggml_backend_tensor_set(sg.attn_mask, pf_mask_buf.data(), 0,
+                                sizeof(uint16_t) * pf_mask_buf.size());
 
         auto st = ggml_backend_graph_compute(backend, sg.gf);
         if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "prefill compute @%d\n", start); return 1; }
@@ -1200,8 +1264,16 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(sg.positions, pos4.data(), 0, sizeof(int32_t) * 4 * N);
 
-            // Ancestor-only attention mask (f16).
-            build_tree_mask(tree, /*past_length=*/committed, mask_buf);
+            // KV write indices: sequential slots committed..committed+N-1.
+            std::vector<int64_t> kv_idxs_tree(N);
+            for (int i = 0; i < N; i++) kv_idxs_tree[i] = (int64_t)(committed + i);
+            ggml_backend_tensor_set(sg.kv_pos_idx, kv_idxs_tree.data(), 0,
+                                    sizeof(int64_t) * kv_idxs_tree.size());
+
+            // Ancestor-only attention mask (f16), padded to sg.n_kv_padded
+            // on the K axis so the read view shape is stable.
+            build_tree_mask(tree, /*past_length=*/committed, mask_buf,
+                            /*kv_pad_override=*/sg.n_kv_padded);
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
                                     sizeof(uint16_t) * mask_buf.size());
 
@@ -1488,7 +1560,14 @@ int main(int argc, char ** argv) {
             }
             ggml_backend_tensor_set(sg.positions, pos4_buf.data(), 0, sizeof(int32_t) * 4 * q_len);
 
-            build_causal_mask(mask_buf, committed + q_len, q_len, committed);
+            {
+                std::vector<int64_t> kv_idxs_b(q_len);
+                for (int i = 0; i < q_len; i++) kv_idxs_b[i] = (int64_t)(committed + i);
+                ggml_backend_tensor_set(sg.kv_pos_idx, kv_idxs_b.data(), 0,
+                                        sizeof(int64_t) * kv_idxs_b.size());
+            }
+            build_causal_mask(mask_buf, committed + q_len, q_len, committed,
+                              /*kv_pad_override=*/sg.n_kv_padded);
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             T_verify_set = sync_us();
             tt_verify_set += std::chrono::duration<double, std::micro>(T_verify_set - T_verify_build).count();
@@ -1524,6 +1603,12 @@ int main(int argc, char ** argv) {
                 int p = committed + i;
                 p4_single[0] = p; p4_single[1] = p; p4_single[2] = p; p4_single[3] = 0;
                 ggml_backend_tensor_set(sg.positions, p4_single, 0, sizeof(int32_t) * 4);
+                int64_t kv_idx_single = (int64_t)(committed + i);
+                ggml_backend_tensor_set(sg.kv_pos_idx, &kv_idx_single, 0, sizeof(int64_t));
+                build_causal_mask(mask_buf, committed + i + 1, 1, committed + i,
+                                  /*kv_pad_override=*/sg.n_kv_padded);
+                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                        sizeof(uint16_t) * mask_buf.size());
 
                 st = ggml_backend_graph_compute(backend, sg.gf);
                 if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "seq verify compute %d at %d\n", (int)st, i); return 1; }
@@ -1728,10 +1813,15 @@ int main(int argc, char ** argv) {
                 replay_pos[3 * commit_n + i] = 0;
             }
             ggml_backend_tensor_set(sg.positions, replay_pos.data(), 0, sizeof(int32_t) * 4 * commit_n);
-            if (replay_with_mask) {
-                build_causal_mask(mask_buf, committed + commit_n, commit_n, committed);
-                ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
+            {
+                std::vector<int64_t> kv_idxs_r(commit_n);
+                for (int i = 0; i < commit_n; i++) kv_idxs_r[i] = (int64_t)(committed + i);
+                ggml_backend_tensor_set(sg.kv_pos_idx, kv_idxs_r.data(), 0,
+                                        sizeof(int64_t) * kv_idxs_r.size());
             }
+            build_causal_mask(mask_buf, committed + commit_n, commit_n, committed,
+                              /*kv_pad_override=*/sg.n_kv_padded);
+            ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             auto T_replay_set = sync_us();
             tt_replay_set += std::chrono::duration<double, std::micro>(T_replay_set - T_replay_build).count();
 
