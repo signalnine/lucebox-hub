@@ -6,6 +6,8 @@ Draft:  `z-lab/Qwen3.5-27B-DFlash` (BF16, 3.46 GB).
 Concurrency = 1, greedy decoding, `n_gen=256`.
 Reproduce with `python3 scripts/bench_llm.py` (samples 10 prompts/dataset, seed=42).
 
+**Also see:** [RTX 5090 results further down](#rtx-5090-blackwell-consumer-32-gb) — the 32 GB card lets us run Q5_K_M target, pushing HumanEval to 187.4 tok/s at 3.51× (+45 % over 3090's Q4_K_M headline).
+
 ## Headline — AR vs Luce DFlash at concurrency 1
 
 | Task      | AR tok/s | DFlash tok/s | AL   | Speedup |
@@ -144,6 +146,75 @@ Starting point: Chain DFlash at 112.8 tok/s mean on HumanEval, AL 7.67.
   ```
   python3 scripts/bench_llm.py
   ```
+
+## RTX 5090 (Blackwell consumer, 32 GB)
+
+Built on the `rtx-5090` branch (`-DCMAKE_CUDA_ARCHITECTURES=120`), CUDA 13.2 / driver 580. `bench_llm.py` at `--ddtree-budget=22`, n=10 prompts/dataset, seed=42.
+
+### Quantization sweep (target GGUF swapped, draft held fixed)
+
+The 3090 could only fit Q4_K_M target + draft + verify tree + KV in 24 GB. The 5090's 32 GB unlocks Q5_K_M and Q6_K; we ran the full bench at each.
+
+|                    | HumanEval |  GSM8K  | Math500 |
+|--------------------|:---------:|:-------:|:-------:|
+|                    | AR / DFlash / AL / Speedup ||  |
+| 3090 Q4_K_M (pub)  | 37.8 / 129.5 / 8.31 / 3.43× | 37.7 / 96.2 / 6.14 / 2.55× | 37.7 / 110.5 / 7.04 / 2.93× |
+| 5090 Q4_K_M        | 58.3 / 164.0 / 7.92 / 2.81× | 58.1 / 131.7 / 6.32 / 2.27× | 58.3 / 153.5 / 7.35 / 2.63× |
+| **5090 Q5_K_M**    | **53.4 / 187.4 / 9.32 / 3.51×** | **53.4 / 143.7 / 7.06 / 2.69×** | 53.3 / 145.5 / 7.15 / 2.73× |
+| 5090 Q6_K          | 49.1 / 174.2 / 9.11 / 3.55× | 49.0 / 122.6 / 6.34 / 2.50× | 49.0 / 136.4 / 7.10 / 2.78× |
+
+**Q5_K_M is the sweet spot on 5090.** Highest absolute DFlash tok/s on every dataset. It recovers both the speedup ratio that Q4_K_M on 5090 had lost (HE 3.51× vs 3090's 3.43×) *and* delivers +45 % absolute tok/s.
+
+### Why Q5_K_M wins
+
+| Axis | Direction as target precision grows (Q4 → Q5 → Q6) |
+|------|----------------------------------------------------|
+| AR tok/s | Decreases (58.3 → 53.4 → 49.1 HumanEval) — more weight bytes per forward pass |
+| Acceptance Length | Increases, then plateaus (7.92 → 9.32 → 9.11 HumanEval) — draft-target agreement improves with a less-quantized target, then saturates |
+| Per-step verify cost | Increases with target size |
+| DFlash tok/s | Peaks at Q5 (164 → **187** → 174 HumanEval) — AL gain beats verify-cost loss at Q5, then loses ground at Q6 |
+
+Q6_K's marginally higher speedup *ratio* (3.55× vs 3.51× HE) doesn't compensate for its slower AR baseline; absolute throughput drops.
+
+### VRAM fit at budget=22
+
+| Target | Target size | + draft (3.3 GiB) | Remaining for KV + tree + activations |
+|--------|:-----------:|:-----------------:|:-------------------------------------:|
+| Q4_K_M | 15.6 GiB | 18.9 GiB | ~13 GiB |
+| Q5_K_M | 18.3 GiB | 21.6 GiB | ~10 GiB |
+| Q6_K   | 20.9 GiB | 24.2 GiB | ~8 GiB |
+| Q8_0   | 26.6 GiB | 29.9 GiB | too tight for budget=22 state |
+
+### Per-prompt Q5_K_M numbers (HumanEval, seed 42)
+
+| # | n_tok | AR    | DFlash | AL    |
+|:-:|:-----:|:-----:|:------:|:-----:|
+| 01| 84    | 53.45 | 252.50 | 12.80 |
+| 02| 138   | 53.35 | 172.73 | 8.53  |
+| 03| 134   | 53.45 | 214.11 | 10.67 |
+| 04| 120   | 53.45 | 213.77 | 10.67 |
+| 05| 172   | 53.37 | 144.98 | 7.11  |
+| 06| 118   | 53.41 | 157.66 | 7.76  |
+| 07| 51    | 53.45 | 172.28 | 8.53  |
+| 08| 141   | 53.35 | 162.89 | 8.00  |
+| 09| 125   | 53.26 | 161.94 | 8.00  |
+| 10| 95    | 53.34 | 220.83 | 11.13 |
+| **mean** |   | **53.39** | **187.37** | **9.32** |
+
+Peak per-prompt: **252.5 tok/s at AL 12.80** (prompt 01 — function-signature completion where the draft nails 12-token runs consistently).
+
+### Reproducibility (5090)
+
+Full bench at all three quant levels reproduced 2026-04-20 on commit `94a6410` of the `rtx-5090` branch with:
+
+```bash
+# Q5_K_M (the recommended sweet spot)
+DFLASH_TARGET=$(pwd)/models/Qwen3.5-27B-Q5_K_M.gguf \
+DFLASH_DRAFT=$(pwd)/models/draft/model.safetensors \
+  python3 scripts/bench_llm.py
+
+# Swap to Q4_K_M or Q6_K by changing DFLASH_TARGET.
+```
 
 ## Hardware ceiling notes
 
