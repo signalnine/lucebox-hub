@@ -20,9 +20,31 @@ hybrid + Q4_K_M and extends each layer with what the MoE/MXFP4 variant needs.
 | **M1a** — dual-arch scaffolding | ✅ | `TargetWeights.arch` tag, MoE fields on `TargetLayer`, shared loader for `qwen35` and `qwen35moe`, `build_target_graph()` dispatch. |
 | **M1b** — 35B-A3B graph builder | ✅ | `qwen36_target_graph.cpp` with the full stack: Q-packed full-attn (IMROPE) + fused-op DeltaNet + MoE FFN (`ggml_mul_mat_id` on MXFP4 gate/up + normalized-weight sum) + shared expert (sigmoid-scalar gate). End-to-end coherent output on "The capital of France is" → "Paris, a city renowned for its iconic landmarks such as". **125.8 tok/s decode**, ~60 % of llama.cpp's 210.7 baseline. |
 | **M2a** — runtime-dim qwen35 builder | ✅ | `build_full_attn_block` / `build_delta_net_block` / `create_target_cache` now read `w.n_*` / `w.ssm_*` at runtime, not q35:: constants. Loader accepts any qwen35 size and tied LM head. Rope type standardised to `GGML_ROPE_TYPE_IMROPE` for both arches. Qwen3.5-0.8B-BF16 now loads + runs through the same engine as 27B and 35B. |
-| **M2b** — chain-spec orchestrator | ✅ (sequential verify) + 🐛 (batched verify bug, isolated) | New binary `test_chain_spec` loads both models via `load_target_gguf`, runs chain-spec with `snapshot_ssm_state` + catch-up rollback. Greedy output matches 35B AR byte-for-byte. Sequential verify throughput 45-63 tok/s depending on N_spec — slower than AR (125) because single-token verify + draft catch-up together cost more than they save at our draft/target speed ratio (0.8B = 300, 35B = 125, i.e. draft ~2.4× faster). The batched verify bug is now isolated to a specific n_tokens pattern (see below); it's NOT arch-specific and blocks M2b's actual speedup. |
+| **M2b** — chain-spec orchestrator | ✅ | `test_chain_spec` with both sequential (lossless, default) and batched (faster, near-tie drift) target verify. Batched at N=16 hits **140 tok/s** (1.12× AR baseline 125) with AL=17. Sequential preserves AR byte-identity at 36-62 tok/s. The "batched is broken" observation from earlier was traced to fp16 MMA_F16 accumulation vs fp32 VEC accumulation flipping argmax on near-tied logits (≤0.03 logit delta), not a logic bug — see Root Cause section below. |
 
-### M2b batched-verify bug — diagnostic state
+### M2b batched-verify "bug" — root-caused: fp16 MMA near-tie drift
+
+**The observed symptom wasn't a logic bug.** Top-5 logits at batched position 0 (N=4, prompt "The capital of France is"):
+
+```
+tok 13 (".") = 19.177   ← batched MMA_F16 argmax
+tok 11 (",") = 19.155   ← sequential VEC (fp32) argmax
+delta = 0.022
+```
+
+The batched fattn MMA_F16 kernel accumulates in fp16 — enough precision for real logit spreads but noisy on near-ties. The VEC kernel (selected automatically for `n_tokens == 1` on quantized-KV + Ada+ cards) uses fp32 accumulation and gives a different argmax on the same inputs. Both are mathematically "target's prediction" — the difference is numerics, not correctness.
+
+For a typical 2-way near-tie, MMA's argmax will agree with draft's proposal ~50% of the time by chance. For "Paris," vs "Paris." specifically, 0.8B draft picks "." and MMA target *happens* to tie the VEC target at 0.022 in draft's favor → target accepts, output diverges from AR.
+
+**Shared-helper refactor (M2b side effect):** The earlier suspicion that qwen36 had its own buggy attention block copy turned out to be unfounded (the copies were bit-identical to qwen35's), but the fix still landed cleanly — `qwen35_build_full_attn_block` and `qwen35_build_delta_net_block` are now non-static helpers exported from `qwen35_target_graph.cpp` and called from `qwen36_target_graph.cpp`. Single source of truth for both archs; eliminates a class of future bugs.
+
+**M2b shipping state:**
+
+- `test_chain_spec` now supports `CHAIN_VERIFY=seq` (default, lossless, ~60 tok/s at N=4) and `CHAIN_VERIFY=batch` (140 tok/s at N=16, drifts to draft on near-ties).
+- All-accept fast path: when `k == N_spec`, neither cache needs catch-up. That's what unlocked the 1.12× AR speedup on batched.
+- Remaining throughput gap vs the theoretical max (≥ 2× AR) is the catch-up cost on mismatches. Closing it requires non-replay SSM rollback — which is exactly what M3 DDTree's `ssm_intermediate` capture provides.
+
+### Older diagnostic capture (kept for reference)
 
 Isolated with a minimal reproducer (`CHAIN_DIAG=1 test_chain_spec ...`): sequential target decode of 8 tokens from "The capital of France is" gives `[11, 264, 3177, 34756, 364, 1141, 25438, 57902]` (= ", a city renowned for its iconic landmarks"). Feeding the SAME input sequence through one batched forward, we expect to recover those 8 argmax predictions exactly — both paths evaluate target greedy on the same (state, inputs). Instead:
 

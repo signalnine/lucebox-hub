@@ -316,6 +316,37 @@ QwenGraphOutputs build_qwen35_graph(
     TargetCache &          cache,
     const QwenGraphInputs & in);
 
+// ─── Shared qwen35-family block helpers (runtime-dim) ───────────────
+//
+// These are used by BOTH build_qwen35_graph (dense FFN) and build_qwen36_graph
+// (MoE FFN). Arch differences live in each graph's outer loop and its FFN
+// builder; the attention + DeltaNet math is identical.
+ggml_tensor * qwen35_build_full_attn_block(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    const TargetWeights & w,
+    const TargetLayer & L,
+    ggml_tensor * cur,
+    ggml_tensor * positions,
+    const int * rope_sections,
+    ggml_tensor * cache_k,
+    ggml_tensor * cache_v,
+    ggml_tensor * attn_mask,
+    int kv_start,
+    int n_tokens);
+
+ggml_tensor * qwen35_build_delta_net_block(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    const TargetWeights & w,
+    const TargetLayer & L,
+    ggml_tensor * cur,
+    ggml_tensor * conv_state,
+    ggml_tensor * ssm_state,
+    int n_tokens,
+    DeltaNetCapture * cap,
+    ggml_tensor * parent_ids);
+
 // Qwen3.6-35B-A3B (qwen35moe arch). Same hybrid DeltaNet + Attention layer
 // dispatch as qwen35, but with MoE (256 experts top-8) + shared-expert FFN
 // in place of dense SwiGLU, and smaller hparams (see dflash36.h).

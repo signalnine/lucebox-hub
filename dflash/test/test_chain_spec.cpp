@@ -234,13 +234,29 @@ static void verify_batch(
         std::fprintf(stderr, "batch compute failed at pos=%d n=%d\n", pos, n_tokens); std::exit(1);
     }
 
-    // Debug: logits shape once
+    // Debug: logits shape + top-5 logits at pos 0 for the FIRST N=4 call
+    // (that's the smallest N where we see the pos-0 wrong bug).
     static int dumped = 0;
-    if (!dumped) {
+    if (!dumped && n_tokens == 4) {
         dumped = 1;
         std::printf("[debug] verify logits ne=[%ld,%ld,%ld,%ld]\n",
                     (long)sg.logits->ne[0], (long)sg.logits->ne[1],
                     (long)sg.logits->ne[2], (long)sg.logits->ne[3]);
+        // Pull pos-0 logits now
+        const int vc = (int)w.embedder.n_vocab;
+        std::vector<float> pos0_logits(vc);
+        ggml_backend_tensor_get(sg.logits, pos0_logits.data(), 0, sizeof(float) * vc);
+        // top-5
+        std::vector<int> idx(vc);
+        for (int i = 0; i < vc; i++) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+            [&](int a, int b){ return pos0_logits[a] > pos0_logits[b]; });
+        std::printf("[debug] pos0 top-5: ");
+        for (int k = 0; k < 5; k++)
+            std::printf("%d=%.3f ", idx[k], pos0_logits[idx[k]]);
+        std::printf("\n[debug] pos0 tok 11=%.3f, tok 13=%.3f, delta=%.3f\n",
+                    pos0_logits[11], pos0_logits[13],
+                    pos0_logits[11] - pos0_logits[13]);
     }
 
     // Logits shape: [vocab, n_tokens]. Extract per-position argmax.
@@ -273,6 +289,28 @@ int main(int argc, char ** argv) {
     const int    N_spec      = std::atoi(argv[5]);
     const char * out_path    = argv[6];
     if (N_spec < 1 || N_spec > 64) { std::fprintf(stderr, "N_spec out of range\n"); return 1; }
+
+    // Verify mode:
+    //   CHAIN_VERIFY=seq     → sequential single-token target verify, byte-
+    //                          identical to AR but slower (~50 tok/s)
+    //   CHAIN_VERIFY=batch   → batched N-token target verify, faster
+    //                          (~135-165 tok/s on 35B) but MMA_F16 fp16
+    //                          accumulation resolves near-tie argmax
+    //                          differently than VEC fp32 (sequential path).
+    //                          Target's greedy output drifts toward what
+    //                          the fp16-rounded target prefers, which on
+    //                          this prompt happens to agree with draft more
+    //                          often → higher acceptance, faster, but the
+    //                          committed text loops ("Paris. The capital of
+    //                          France is Paris.") instead of continuing
+    //                          ("Paris, a city renowned..."). Use batch only
+    //                          when ~2% per-position accept-rate drift is
+    //                          acceptable for a 1.3× throughput gain.
+    // Default = seq (lossless).
+    bool use_batched_verify = false;
+    if (const char * s = std::getenv("CHAIN_VERIFY")) {
+        if (std::string(s) == "batch") use_batched_verify = true;
+    }
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -334,9 +372,9 @@ int main(int argc, char ** argv) {
             c_tgt.cur_pos = i + 1;
         }
         const int P = (int)prompt.size();
-        const int N = 8;
-        int32_t seq_preds[8];
-        int32_t batch_preds[8];
+        const int N = 16;
+        int32_t seq_preds[16];
+        int32_t batch_preds[16];
 
         // Snapshot target state after prefill.
         snapshot_ssm_state(c_tgt);
@@ -357,15 +395,15 @@ int main(int argc, char ** argv) {
         c_tgt.cur_pos = P;
 
         // Batched at various N values (fresh snapshot+restore each time).
-        int32_t all_inputs[8] = { tp,
-            seq_preds[0], seq_preds[1], seq_preds[2], seq_preds[3],
-            seq_preds[4], seq_preds[5], seq_preds[6] };
-        for (int try_n = 1; try_n <= N; try_n++) {
+        int32_t all_inputs[16] = { tp };
+        for (int i = 1; i < 16; i++) all_inputs[i] = seq_preds[i - 1];
+        for (int try_n : { 1, 2, 3, 4, 5, 6, 8, 12, 16 }) {
             restore_ssm_state(c_tgt);
             c_tgt.cur_pos = P;
             StepGraph sg_try; std::vector<uint16_t> mbt;
             std::vector<float> ebt(w_tgt.n_embd * try_n), lbt;
-            int32_t out_try[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+            int32_t out_try[16];
+            for (int i = 0; i < 16; i++) out_try[i] = -1;
             verify_batch(w_tgt, c_tgt, backend, sg_try,
                          all_inputs, try_n, P, ebt, lbt, mbt, out_try);
             step_graph_free(sg_try);
@@ -490,9 +528,9 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        // Snapshot draft SSM state pre-round. Target uses short-circuit
-        // sequential verify so no target snapshot is needed below.
+        // Snapshot both models' SSM state pre-round.
         snapshot_ssm_state(c_drf);
+        snapshot_ssm_state(c_tgt);
 
         // 1. Draft: N sequential forwards starting from last_tok.
         int32_t carry = last_tok;
@@ -503,23 +541,32 @@ int main(int argc, char ** argv) {
         }
         n_drafted += N_spec;
 
-        // 2. Target sequential verify with short-circuit on first mismatch.
-        //    Batched verify (one N-token forward) would be the real win here
-        //    and is drafted in verify_batch() below, but there is an
-        //    outstanding correctness bug: when called with target weights,
-        //    verify_batch produces logits that match the draft's output
-        //    instead of the target's. Single-step target_step at the same
-        //    (last_tok, pos) gives the correct argmax, so the single-token
-        //    path works. Needs a debug session with a logit-diff check on
-        //    position 0 of the N-token forward against the single-step logit.
+        // 2. Target verify — either batched (fast, near-tie drift) or
+        //    sequential (slower, byte-identical to AR).
         int k = 0;
         int32_t t_pred = -1;
-        carry = last_tok;
-        for (int i = 0; i < N_spec; i++) {
-            t_pred = step_tgt(carry, pre_pos + i);
-            c_tgt.cur_pos = pre_pos + i + 1;
-            if (t_pred == drafts[i]) { k++; carry = drafts[i]; }
-            else                    { break; }
+        if (use_batched_verify) {
+            verify_in[0] = last_tok;
+            for (int i = 1; i < N_spec; i++) verify_in[i] = drafts[i - 1];
+            verify_batch(w_tgt, c_tgt, backend, sg_tgt,
+                         verify_in.data(), N_spec, pre_pos,
+                         embed_tgt, logits_tgt, mask_buf, verify_out.data());
+            c_tgt.cur_pos = pre_pos + N_spec;
+            for (int i = 0; i < N_spec; i++) {
+                if (verify_out[i] == drafts[i]) k++;
+                else break;
+            }
+            t_pred = verify_out[k < N_spec ? k : N_spec - 1];
+        } else {
+            // Sequential verify: short-circuit on first mismatch; target
+            // cache naturally stops at pre_pos + commit_count.
+            int32_t carry = last_tok;
+            for (int i = 0; i < N_spec; i++) {
+                t_pred = step_tgt(carry, pre_pos + i);
+                c_tgt.cur_pos = pre_pos + i + 1;
+                if (t_pred == drafts[i]) { k++; carry = drafts[i]; }
+                else                    { break; }
+            }
         }
         n_matched += k;
 
@@ -531,22 +578,34 @@ int main(int argc, char ** argv) {
 
         int32_t next_last_tok = (k < N_spec) ? t_pred : drafts[N_spec - 1];
 
-        // 3. Target cache is already at pre_pos + commit_count (short-circuit
-        //    stopped feeding further). No target rollback needed.
-        if (c_tgt.cur_pos != pre_pos + commit_count) {
-            std::fprintf(stderr, "tgt desync: %d vs %d\n", c_tgt.cur_pos, pre_pos + commit_count);
-            return 1;
+        // 4. Rollback.
+        //    Target side — batched path consumed all N_spec tokens into cache,
+        //    so if k < N_spec we need target catch-up; if k == N_spec, target
+        //    cache is already at pre_pos + N_spec, nothing to do.
+        //    Sequential path short-circuited at the first mismatch; target
+        //    cache is naturally at pre_pos + commit_count.
+        //    Draft side — always consumed all N_spec; needs catch-up when
+        //    commit_count < N_spec.
+        auto catch_up = [&](const TargetWeights & w, TargetCache & cache, StepGraph & sg,
+                            std::vector<float> & eb, std::vector<float> & lb,
+                            int32_t first_tok) {
+            restore_ssm_state(cache);
+            cache.cur_pos = pre_pos;
+            int32_t cur = first_tok;
+            for (int i = 0; i < commit_count; i++) {
+                (void)step_model(w, cache, backend, sg, cur, pre_pos + i, eb, lb);
+                cache.cur_pos = pre_pos + i + 1;
+                cur = (i + 1 < commit_count) ? drafts[i] : -1;
+            }
+        };
+        if (commit_count < N_spec) {
+            catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf, last_tok);
+            if (use_batched_verify) {
+                catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt, last_tok);
+            }
         }
-
-        // 4. Draft: restore_ssm_state + commit_count catch-up single forwards.
-        restore_ssm_state(c_drf);
-        c_drf.cur_pos = pre_pos;
-        int32_t cur = last_tok;
-        for (int i = 0; i < commit_count; i++) {
-            (void)step_drf(cur, pre_pos + i);
-            c_drf.cur_pos = pre_pos + i + 1;
-            cur = (i + 1 < commit_count) ? drafts[i] : -1;
-        }
+        // When commit_count == N_spec (all match), both caches sit at the
+        // correct next-round pre_pos. Nothing to do.
 
         last_tok = next_last_tok;
         n_rounds++;

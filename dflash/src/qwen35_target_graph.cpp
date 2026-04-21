@@ -281,7 +281,7 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
 // (shape [head_dim, max_ctx, n_head_kv] f16). We write the new K/V for
 // `n_tokens` new positions starting at `kv_start`, then run causal attention
 // over [0..kv_start + n_tokens).
-static ggml_tensor * build_full_attn_block(
+ggml_tensor * qwen35_build_full_attn_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
     const TargetWeights & w,
@@ -392,7 +392,7 @@ static ggml_tensor * build_full_attn_block(
 // `cap->conv_input` with the concatenated conv input (old state + new tokens),
 // both of which are marked as graph outputs so the caller can rollback SSM and
 // conv state to any intermediate step commit_n-1 without a replay forward pass.
-static ggml_tensor * build_delta_net_block(
+ggml_tensor * qwen35_build_delta_net_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
     const TargetWeights & w,
@@ -686,7 +686,7 @@ QwenGraphOutputs build_qwen35_graph(
         ggml_tensor * cur = rms_norm_mul(ctx, inpL, L.attn_norm, eps);
 
         if (is_attn) {
-            cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
+            cur = qwen35_build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
                                         in.attn_mask, in.kv_start, n_tokens);
             fa_idx++;
@@ -697,7 +697,7 @@ QwenGraphOutputs build_qwen35_graph(
                 cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
                 cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
             }
-            cur = build_delta_net_block(ctx, gf, w, L, cur,
+            cur = qwen35_build_delta_net_block(ctx, gf, w, L, cur,
                                         cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
                                         n_tokens, cap_ptr, in.parent_ids);
             dn_idx++;
