@@ -44,6 +44,13 @@ struct StepGraph {
 // Build a fresh single-token forward graph. We rebuild per step so that
 // `kv_start` updates drive the correct KV cache slot. The graph is cheap to
 // rebuild — all the weights + KV cache stay persistent.
+// Build a per-step forward graph. The ggml ctx + graph are rebuilt each call
+// (they're cheap CPU-side tensor descriptors), but the CUDA allocator
+// `sg.alloc` is created once and reused — ggml_gallocr reallocates its
+// backing CUDA buffer lazily only when the graph's peak working set grows,
+// which never happens in AR decode where every step has the same n_tokens=1
+// shape. This avoids ~1-3 ms of cudaMalloc/cudaFree per step, which was
+// dominating tok/s on RTX 5090 where each forward is only ~5 ms.
 static bool build_step_graph(
     StepGraph & sg,
     const TargetWeights & w,
@@ -51,7 +58,6 @@ static bool build_step_graph(
     ggml_backend_t backend,
     int kv_start
 ) {
-    if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
     if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
 
     ggml_init_params ip{};
@@ -84,7 +90,9 @@ static bool build_step_graph(
     ggml_build_forward_expand(sg.gf, go.logits);
     sg.logits = go.logits;
 
-    sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!sg.alloc) {
+        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    }
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
 }
 
@@ -165,12 +173,25 @@ int main(int argc, char ** argv) {
 
     StepGraph sg;
 
+    // Per-step timing accumulators (enabled with DFLASH27B_TTX=1).
+    const bool tt_enable = [] {
+        const char * s = std::getenv("DFLASH27B_TTX");
+        return s && std::atoi(s) != 0;
+    }();
+    double tt_build = 0, tt_embed = 0, tt_set = 0, tt_compute = 0, tt_get = 0, tt_argmax = 0;
+    long long tt_steps = 0;
+    auto now_us = []() {
+        return std::chrono::steady_clock::now();
+    };
+
     // ── Helper: run one step given current token + absolute position
     auto run_step = [&](int32_t tok, int pos) -> int32_t {
+        auto t0 = now_us();
         if (!build_step_graph(sg, w, cache, backend, pos)) {
             std::fprintf(stderr, "build_step_graph failed at pos=%d\n", pos);
             std::exit(1);
         }
+        auto t1 = now_us();
 
         // CPU embed
         int32_t ids[1] = { tok };
@@ -178,27 +199,41 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "embed failed tok=%d\n", tok);
             std::exit(1);
         }
+        auto t2 = now_us();
         ggml_backend_tensor_set(sg.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * embed_buf.size());
 
         // M-RoPE positions: 4 copies of pos
         int32_t p4[4] = { pos, pos, pos, pos };
         ggml_backend_tensor_set(sg.positions, p4, 0, sizeof(int32_t) * 4);
+        auto t3 = now_us();
 
         auto st = ggml_backend_graph_compute(backend, sg.gf);
         if (st != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "compute failed at pos=%d (%d)\n", pos, (int)st);
             std::exit(1);
         }
+        auto t4 = now_us();
 
         // argmax on logits
         const int vocab = (int)w.embedder.n_vocab;
         std::vector<float> logits(vocab);
         ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
+        auto t5 = now_us();
         int best = 0;
         float bv = logits[0];
         for (int i = 1; i < vocab; i++) {
             if (logits[i] > bv) { bv = logits[i]; best = i; }
+        }
+        auto t6 = now_us();
+        if (tt_enable) {
+            tt_build   += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            tt_embed   += std::chrono::duration<double, std::micro>(t2 - t1).count();
+            tt_set     += std::chrono::duration<double, std::micro>(t3 - t2).count();
+            tt_compute += std::chrono::duration<double, std::micro>(t4 - t3).count();
+            tt_get     += std::chrono::duration<double, std::micro>(t5 - t4).count();
+            tt_argmax  += std::chrono::duration<double, std::micro>(t6 - t5).count();
+            tt_steps++;
         }
         return best;
     };
@@ -222,6 +257,14 @@ int main(int argc, char ** argv) {
     }
     auto t_end = std::chrono::steady_clock::now();
     double secs = std::chrono::duration<double>(t_end - t_start).count();
+
+    if (tt_enable && tt_steps > 0) {
+        const double inv = 1.0 / (double)tt_steps;
+        std::printf("[ttx] per-step us: build=%.0f embed=%.0f set=%.0f compute=%.0f get=%.0f argmax=%.0f total=%.0f\n",
+                    tt_build * inv, tt_embed * inv, tt_set * inv,
+                    tt_compute * inv, tt_get * inv, tt_argmax * inv,
+                    (tt_build+tt_embed+tt_set+tt_compute+tt_get+tt_argmax) * inv);
+    }
     double tps  = n_gen / std::max(1e-9, secs);
 
     // Also push the final next token so downstream sees it

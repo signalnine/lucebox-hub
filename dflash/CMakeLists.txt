@@ -20,6 +20,12 @@ endif()
 # Hardcoded for CUDA. No libllama, no BLAS, no Metal, no Vulkan.
 
 set(GGML_CUDA         ON  CACHE BOOL "" FORCE)
+# CUDA graphs: llama.cpp's top-level CMakeLists turns this on; the upstream
+# ggml default is OFF. Without it each forward step launches every kernel
+# individually, costing ~2-3 ms on RTX 5090 for 35B decode (see ttx). With
+# it, ggml captures the graph once and re-launches the whole thing per step
+# — the bulk of the llama.cpp AR throughput advantage.
+set(GGML_CUDA_GRAPHS  ON  CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL   OFF CACHE BOOL "" FORCE)
 set(GGML_METAL        OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN       OFF CACHE BOOL "" FORCE)
