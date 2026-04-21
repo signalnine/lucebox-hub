@@ -136,14 +136,22 @@ bool create_target_cache(const TargetWeights & w,
     const int cache_head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;        // 128
     const int cache_dt_rank    = w.ssm_dt_rank;                        // 48 / 32
 
+    // KV cache layout: [n_embd_gqa, max_ctx] (matches llama.cpp's
+    // llama-kv-cache.cpp). n_embd_gqa = head_dim * n_head_kv with the two
+    // axes MERGED so the "row" dim (position) is the slowest — required by
+    // ggml_set_rows, which writes full rows indexed by a position tensor.
+    // The graph builder views this as [head_dim, n_head_kv, n_kv_padded]
+    // on read. See ttx "cache-layout refactor" for the motivation.
+    const int cache_n_embd_gqa = cache_head_dim * cache_n_head_kv;
+
     int fa_idx = 0, dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         if (is_attn) {
-            ggml_tensor * K = ggml_new_tensor_3d(out.ctx, kv_k_type,
-                                                 cache_head_dim, max_ctx, cache_n_head_kv);
-            ggml_tensor * V = ggml_new_tensor_3d(out.ctx, kv_v_type,
-                                                 cache_head_dim, max_ctx, cache_n_head_kv);
+            ggml_tensor * K = ggml_new_tensor_2d(out.ctx, kv_k_type,
+                                                 cache_n_embd_gqa, max_ctx);
+            ggml_tensor * V = ggml_new_tensor_2d(out.ctx, kv_v_type,
+                                                 cache_n_embd_gqa, max_ctx);
             char name[64];
             std::snprintf(name, sizeof(name), "cache_k_%d", il); ggml_set_name(K, name);
             std::snprintf(name, sizeof(name), "cache_v_%d", il); ggml_set_name(V, name);
@@ -279,9 +287,13 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
 // Full-attention block (matches llama.cpp's build_layer_attn for qwen35)
 //
 // `cache_k` / `cache_v` are the persistent KV buffers for this layer
-// (shape [head_dim, max_ctx, n_head_kv] f16). We write the new K/V for
-// `n_tokens` new positions starting at `kv_start`, then run causal attention
-// over [0..kv_start + n_tokens).
+// (shape [n_embd_gqa, max_ctx] f16, matching llama.cpp's layout). We write
+// the new K/V rows via ggml_set_rows(cache, k_cur_2d, kv_pos_idx) — the
+// position indices live in an input tensor so the graph structure stays
+// constant across decode steps. Read view is sized [head_dim, n_head_kv,
+// n_kv_padded] where n_kv_padded is the caller's GGML_PAD'd kv length —
+// stable across 256-step windows, which lets ggml-cuda reuse the captured
+// CUDA graph via cudaGraphExecUpdate.
 ggml_tensor * qwen35_build_full_attn_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
@@ -290,16 +302,18 @@ ggml_tensor * qwen35_build_full_attn_block(
     ggml_tensor * cur,              // [hidden, n_tokens]
     ggml_tensor * positions,        // [n_tokens] i32
     const int * rope_sections,
-    ggml_tensor * cache_k,          // [head_dim, max_ctx, n_head_kv]
+    ggml_tensor * cache_k,          // [n_embd_gqa, max_ctx]
     ggml_tensor * cache_v,
-    ggml_tensor * attn_mask,        // [kv_len, n_tokens] f32 or nullptr
-    int kv_start,
+    ggml_tensor * attn_mask,        // [n_kv_padded, n_tokens_padded] f16 or nullptr
+    ggml_tensor * kv_pos_idx,       // i64 [n_tokens] row indices for set_rows
+    int n_kv_padded,
     int n_tokens
 ) {
     const int head_dim  = w.n_embd_head_k;   // 256 for all qwen35 sizes
     const int n_head    = w.n_head;
     const int n_head_kv = w.n_head_kv;
     const int q_dim     = n_head * head_dim;
+    const int n_embd_gqa = head_dim * n_head_kv;
 
     // Packed Q || gate: wq outputs [2 * q_dim, n_tokens]
     ggml_tensor * QG = ggml_mul_mat(ctx, L.wq, cur);
@@ -344,33 +358,42 @@ ggml_tensor * qwen35_build_full_attn_block(
                            n_rot, sections, rope_type,
                            0, q35::ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
-    ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
-
-    ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-        head_dim, n_tokens, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2],
-        cache_k->nb[1] * kv_start);
-    ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-        head_dim, n_tokens, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2],
-        cache_v->nb[1] * kv_start);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
-
-    const int kv_len        = kv_start + n_tokens;
-    const int fattn_stride  = 1;
-    const int kv_len_padded = ((kv_len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    // ── KV write via ggml_set_rows ───────────────────────────────────────
+    // Kcur/Vcur after reshape: [head_dim, n_head_kv, n_tokens]. The merged
+    // cache layout [n_embd_gqa, max_ctx] wants rows of shape [n_embd_gqa]
+    // written at `kv_pos_idx` rows. A view_2d reinterprets the per-token
+    // [head_dim, n_head_kv] slice as a single [n_embd_gqa] row — safe
+    // because head_dim is contiguous and n_head_kv is the next axis.
+    ggml_tensor * Kcur_2d = ggml_view_2d(ctx, Kcur,
+        n_embd_gqa, n_tokens, Kcur->nb[2], 0);
+    ggml_tensor * Vcur_2d = ggml_view_2d(ctx, Vcur,
+        n_embd_gqa, n_tokens, Vcur->nb[2], 0);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_2d, kv_pos_idx));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_2d, kv_pos_idx));
 
     ggml_tensor * Qfa = ggml_permute(ctx, Q, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
 
-    ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
-        head_dim, kv_len_padded, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], 0);
-    ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
-        head_dim, kv_len_padded, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], 0);
+    // ── KV read: view the merged [n_embd_gqa, max_ctx] cache as the
+    //    logical [head_dim, n_head_kv, n_kv_padded] shape (llama.cpp's
+    //    get_k layout), then permute to [head_dim, n_kv_padded, n_head_kv]
+    //    which is what ggml_flash_attn_ext expects. n_kv_padded is the
+    //    caller's already-padded kv length; keeping it constant across
+    //    successive steps is what lets the CUDA graph be reused.
+    const size_t k_row_size = ggml_row_size(cache_k->type, n_embd_gqa);
+    const size_t v_row_size = ggml_row_size(cache_v->type, n_embd_gqa);
+    ggml_tensor * Kview = ggml_view_3d(ctx, cache_k,
+        head_dim, n_head_kv, n_kv_padded,
+        ggml_row_size(cache_k->type, head_dim),   // nb[1] — between heads within a row
+        k_row_size,                               // nb[2] — between rows (positions)
+        0);
+    ggml_tensor * Vview = ggml_view_3d(ctx, cache_v,
+        head_dim, n_head_kv, n_kv_padded,
+        ggml_row_size(cache_v->type, head_dim),
+        v_row_size,
+        0);
+    ggml_tensor * Kfa = ggml_permute(ctx, Kview, 0, 2, 1, 3);  // → [head_dim, n_kv_padded, n_head_kv]
+    ggml_tensor * Vfa = ggml_permute(ctx, Vview, 0, 2, 1, 3);
 
     const float kq_scale = 1.0f / std::sqrt((float)head_dim);
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
@@ -689,7 +712,7 @@ QwenGraphOutputs build_qwen35_graph(
         if (is_attn) {
             cur = qwen35_build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                        in.attn_mask, in.kv_start, n_tokens);
+                                        in.attn_mask, in.kv_pos_idx, in.n_kv_padded, n_tokens);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

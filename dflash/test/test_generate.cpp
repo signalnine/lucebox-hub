@@ -36,9 +36,12 @@ struct StepGraph {
     ggml_context *    ctx = nullptr;
     ggml_cgraph *     gf  = nullptr;
     ggml_gallocr_t    alloc = nullptr;
-    ggml_tensor *     inp_embed = nullptr;
-    ggml_tensor *     positions = nullptr;
-    ggml_tensor *     logits    = nullptr;
+    ggml_tensor *     inp_embed  = nullptr;
+    ggml_tensor *     positions  = nullptr;
+    ggml_tensor *     kv_pos_idx = nullptr;   // i64 [n_tokens] row indices for KV set_rows
+    ggml_tensor *     attn_mask  = nullptr;   // f16 [n_kv_padded, n_tokens_padded]
+    ggml_tensor *     logits     = nullptr;
+    int               n_kv_padded = 0;
 };
 
 // Build a fresh single-token forward graph. We rebuild per step so that
@@ -83,12 +86,30 @@ static bool build_step_graph(
     ggml_set_input(sg.inp_embed);
     ggml_set_input(sg.positions);
 
+    // KV write index: one i64 per new token. For decode it's just [kv_start].
+    sg.kv_pos_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_input(sg.kv_pos_idx);
+
+    // Pad n_kv so the read view's shape stays stable across consecutive
+    // steps (ggml-cuda's CUDA-graph cache is invalidated on any property
+    // change). 256-aligned pad matches llama.cpp's get_n_kv policy. The
+    // attention mask matches: unused positions filled with -inf.
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len     = kv_start + n_tokens;
+    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int q_pad      = 32;   // KQ_MASK_PAD
+    sg.attn_mask   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
+    ggml_set_input(sg.attn_mask);
+    sg.n_kv_padded = n_kv_padded;
+
     sg.gf = ggml_new_graph_custom(sg.ctx, 8192, false);
 
     QwenGraphInputs gi{};
     gi.inp_embed      = sg.inp_embed;
     gi.positions      = sg.positions;
-    gi.attn_mask      = nullptr;        // n_tokens==1, no mask needed
+    gi.attn_mask      = sg.attn_mask;
+    gi.kv_pos_idx     = sg.kv_pos_idx;
+    gi.n_kv_padded    = n_kv_padded;
     gi.n_tokens       = n_tokens;
     gi.kv_start       = kv_start;
     gi.capture_layers = false;
@@ -215,6 +236,23 @@ int main(int argc, char ** argv) {
         // M-RoPE positions: 4 copies of pos
         int32_t p4[4] = { pos, pos, pos, pos };
         ggml_backend_tensor_set(sg.positions, p4, 0, sizeof(int32_t) * 4);
+
+        // KV write index: single row at absolute position.
+        int64_t pos64 = pos;
+        ggml_backend_tensor_set(sg.kv_pos_idx, &pos64, 0, sizeof(int64_t));
+
+        // Attention mask. Causal over kv_len, -inf past. The n_tokens=1 decode
+        // only uses q row 0; pad rows (1..q_pad-1) get the same row-0 pattern
+        // so fattn never does softmax over an all-(-inf) row (NaN guard).
+        const int kv_len = pos + 1;
+        std::vector<uint16_t> mask((size_t)sg.n_kv_padded * 32, /*F16 -inf*/ 0xFC00);
+        for (int q = 0; q < 32; q++) {
+            for (int k = 0; k < kv_len && k < sg.n_kv_padded; k++) {
+                mask[q * sg.n_kv_padded + k] = /*F16 zero*/ 0x0000;
+            }
+        }
+        ggml_backend_tensor_set(sg.attn_mask, mask.data(), 0,
+                                sizeof(uint16_t) * mask.size());
         auto t3 = now_us();
 
         auto st = ggml_backend_graph_compute(backend, sg.gf);

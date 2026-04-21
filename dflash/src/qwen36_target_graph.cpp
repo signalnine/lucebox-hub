@@ -230,7 +230,7 @@ QwenGraphOutputs build_qwen36_graph(
             cur = qwen35_build_full_attn_block(ctx, gf, w, L, cur,
                                         in.positions, w.rope_sections,
                                         cache.attn_k[fa_idx], cache.attn_v[fa_idx],
-                                        in.attn_mask, in.kv_start, n_tokens);
+                                        in.attn_mask, in.kv_pos_idx, in.n_kv_padded, n_tokens);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;

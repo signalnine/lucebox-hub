@@ -287,7 +287,20 @@ struct DeltaNetCapture {
 struct QwenGraphInputs {
     ggml_tensor * inp_embed;      // [hidden, n_tokens, 1] f32 — pre-embedded by the caller
     ggml_tensor * positions;      // [4 * n_tokens] i32 (M-RoPE needs 4 per token)
-    ggml_tensor * attn_mask;      // optional [kv_len, n_tokens_padded] f32 (causal); nullptr for n_tokens==1
+    ggml_tensor * attn_mask;      // optional [n_kv_padded, n_tokens_padded] f16 (causal); nullptr for n_tokens==1 w/o tree mode
+    // KV write indices. i64 tensor of shape [n_tokens] with the slot index
+    // each new K/V row should be written to (usually [kv_start..kv_start+n_tokens-1]).
+    // Used by ggml_set_rows. Must be non-null whenever any full-attn layer runs.
+    // Making this an input (rather than a compile-time kv_start int baked into
+    // ggml_view offsets) keeps the graph structure constant across decode steps,
+    // which is what lets ggml-cuda's CUDA-graph cache reuse via
+    // cudaGraphExecUpdate instead of re-capturing every step.
+    ggml_tensor * kv_pos_idx = nullptr;
+    // Read-side padding. Full-attn reads a view [head_dim, n_head_kv, n_kv_padded]
+    // from the cache; keeping n_kv_padded stable across successive steps
+    // (aligned up to e.g. 256) avoids invalidating the CUDA graph. Derived
+    // from kv_start + n_tokens at build time.
+    int           n_kv_padded = 0;
     int           n_tokens;       // number of new tokens in this forward
     int           kv_start;       // position where the new tokens begin
     bool          capture_layers; // if true, write captured layer features into cache.target_feat
@@ -329,10 +342,11 @@ ggml_tensor * qwen35_build_full_attn_block(
     ggml_tensor * cur,
     ggml_tensor * positions,
     const int * rope_sections,
-    ggml_tensor * cache_k,
+    ggml_tensor * cache_k,          // [n_embd_gqa, max_ctx] — merged layout
     ggml_tensor * cache_v,
-    ggml_tensor * attn_mask,
-    int kv_start,
+    ggml_tensor * attn_mask,        // f16 [n_kv_padded, n_tokens_padded]; nullptr for n_tokens==1 w/o tree
+    ggml_tensor * kv_pos_idx,       // i64 [n_tokens] — row index into cache for set_rows
+    int n_kv_padded,                // read-view stride, stable across steps via GGML_PAD(kv_start+n_tokens, 256)
     int n_tokens);
 
 ggml_tensor * qwen35_build_delta_net_block(
