@@ -120,48 +120,43 @@ bool create_target_cache(const TargetWeights & w,
     if (const char * s = std::getenv("DFLASH27B_KV_Q4")) {
         if (std::atoi(s) != 0) { kv_k_type = GGML_TYPE_Q4_0; kv_v_type = GGML_TYPE_Q4_0; }
     }
+    // Arch-agnostic dims: read from w.* (populated by load_target_gguf).
+    const int cache_head_dim   = w.n_embd_head_k;                     // 256 for both qwen35 and qwen35moe
+    const int cache_n_head_kv  = w.n_head_kv;                          // 4 (27B) / 2 (35B-A3B)
+    const int cache_conv_ch    = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;  // 10240 / 8192
+    const int cache_conv_kern  = w.ssm_d_conv;                         // 4
+    const int cache_head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;        // 128
+    const int cache_dt_rank    = w.ssm_dt_rank;                        // 48 / 32
+
     int fa_idx = 0, dn_idx = 0;
     for (int il = 0; il < w.n_layer; il++) {
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
         if (is_attn) {
-            // [head_dim, max_ctx, n_head_kv]
             ggml_tensor * K = ggml_new_tensor_3d(out.ctx, kv_k_type,
-                                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+                                                 cache_head_dim, max_ctx, cache_n_head_kv);
             ggml_tensor * V = ggml_new_tensor_3d(out.ctx, kv_v_type,
-                                                 q35::HEAD_DIM, max_ctx, q35::N_HEAD_KV);
+                                                 cache_head_dim, max_ctx, cache_n_head_kv);
             char name[64];
-            std::snprintf(name, sizeof(name), "cache_k_%d", il);
-            ggml_set_name(K, name);
-            std::snprintf(name, sizeof(name), "cache_v_%d", il);
-            ggml_set_name(V, name);
+            std::snprintf(name, sizeof(name), "cache_k_%d", il); ggml_set_name(K, name);
+            std::snprintf(name, sizeof(name), "cache_v_%d", il); ggml_set_name(V, name);
             out.attn_k[fa_idx] = K;
             out.attn_v[fa_idx] = V;
             fa_idx++;
         } else {
-            // ssm_state: [head_v_dim, head_v_dim, num_v_heads]
             ggml_tensor * S  = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
+                                                  cache_head_v_dim, cache_head_v_dim, cache_dt_rank);
             ggml_tensor * Sn = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  q35::HEAD_V_DIM, q35::HEAD_V_DIM, q35::SSM_DT_RANK);
-            // conv_state: [kernel-1, conv_channels]
+                                                  cache_head_v_dim, cache_head_v_dim, cache_dt_rank);
             ggml_tensor * C  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                  q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
+                                                  cache_conv_kern - 1, cache_conv_ch);
             ggml_tensor * Cn = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
-                                                  q35::SSM_CONV_KERN - 1, q35::CONV_CHANNELS);
-            // ssm_intermediate: [S_v, S_v, H_v, max_verify_tokens] — one SSM
-            // state per verify-block token. Sized to cover the largest verify
-            // n_tokens we'll use (chain q_len=16 or DDTree 1+budget).
-            // Stored in f16 to halve memory (~3 MB → 1.5 MB per layer per slot),
-            // letting us fit budgets up to ~50 on 24 GB. The gated_delta_net
-            // kernel converts f32 ↔ f16 on write/read via store/load_inter_state.
+                                                  cache_conv_kern - 1, cache_conv_ch);
             ggml_tensor * Si = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F16,
-                                                  q35::HEAD_V_DIM, q35::HEAD_V_DIM,
-                                                  q35::SSM_DT_RANK, max_verify_tokens);
-            // conv_input_cache: [(K-1) + max_verify_tokens, conv_channels, 1]
-            // — the full conv_input tensor captured during verify.
+                                                  cache_head_v_dim, cache_head_v_dim,
+                                                  cache_dt_rank, max_verify_tokens);
             ggml_tensor * Ci = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
-                                                  (q35::SSM_CONV_KERN - 1) + max_verify_tokens,
-                                                  q35::CONV_CHANNELS, 1);
+                                                  (cache_conv_kern - 1) + max_verify_tokens,
+                                                  cache_conv_ch, 1);
             char name[64];
             std::snprintf(name, sizeof(name), "ssm_state_%d", il);       ggml_set_name(S,  name);
             std::snprintf(name, sizeof(name), "conv_state_%d", il);      ggml_set_name(C,  name);

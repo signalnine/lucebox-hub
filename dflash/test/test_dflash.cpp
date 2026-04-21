@@ -521,7 +521,7 @@ static bool build_target_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -587,7 +587,7 @@ static bool build_target_step_tree(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
@@ -649,7 +649,7 @@ static bool build_draft_step(
     sg.ctx = ggml_init(ip);
     if (!sg.ctx) return false;
 
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
+    const int hidden = tw.n_embd;
     const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
     const int fc_in  = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
 
@@ -811,7 +811,7 @@ int main(int argc, char ** argv) {
 
     // ── Profile mode: microbench target forward at varying N ───────────
     if (profile_scaling) {
-        const int hidden_p = DFLASH27B_TARGET_HIDDEN;
+        const int hidden_p = w.n_embd;
         StepGraph psg;
         const int n_values[] = { 1, 4, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128 };
         std::printf("[profile] target forward ms at varying N (kv_start=0, no capture)\n");
@@ -874,8 +874,8 @@ int main(int argc, char ** argv) {
     std::printf("\n");
 
     const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab  = DFLASH27B_TARGET_VOCAB;
+    const int hidden = w.n_embd;
+    const int vocab  = (int)w.embedder.n_vocab;
     const int mask_tok = DFLASH27B_DRAFT_MASK_TOKEN_ID;
 
     if ((int)prompt.size() + n_gen + q_len > max_ctx) {
