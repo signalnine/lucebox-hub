@@ -22,6 +22,13 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 
+#include <cuda_runtime.h>
+
+extern "C" void dflash27b_launch_f16_to_f32(const void * src,
+                                            void * dst,
+                                            size_t n_elems,
+                                            cudaStream_t stream);
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -61,6 +68,9 @@ struct StepGraph {
     ggml_tensor *     parent_ids = nullptr;   // tree-mode only
     ggml_tensor *     logits     = nullptr;
     int               n_tokens   = 0;
+    // Tree-mode only: one entry per delta-net layer. Populated when
+    // capture_delta_intermediate=true. Used by DDTree fast rollback.
+    std::vector<dflash27b::DeltaNetCapture> delta_captures;
 };
 static void step_graph_free(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
@@ -72,6 +82,7 @@ static void step_graph_free(StepGraph & sg) {
     sg.parent_ids = nullptr;
     sg.logits     = nullptr;
     sg.n_tokens   = 0;
+    sg.delta_captures.clear();
 }
 
 // Flash-attn mask alignment (test_dflash convention: 32 on both axes).
@@ -381,8 +392,9 @@ static bool build_step_graph_tree(
     if (!go.logits) return false;
     ggml_set_output(go.logits);
     ggml_build_forward_expand(sg.gf, go.logits);
-    sg.logits   = go.logits;
-    sg.n_tokens = n_tokens;
+    sg.logits         = go.logits;
+    sg.delta_captures = std::move(go.delta_captures);
+    sg.n_tokens       = n_tokens;
 
     sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
@@ -578,6 +590,123 @@ static void verify_tree(
             if (row[k] > bv) { bv = row[k]; best = k; }
         argmax_out[i] = best;
     }
+}
+
+// Fast DDTree rollback: reconstruct target cache state to "after processing
+// accepted path of length commit_count". Ported from test_dflash.cpp.
+//
+// Inputs (all on device):
+//   sg.delta_captures[il].ssm_intermediate_states  f16 [S_v, S_v, H_v, N]
+//   sg.delta_captures[il].conv_input               f32 [(K-1)+N, ch, 1]
+//   cache.ssm_state[il]                            f32 [S_v, S_v, H_v]
+//   cache.conv_state[il]                           f32 [(K-1), ch]
+//
+// Steps per delta-net layer:
+//   (a) SSM: copy ssm_intermediate_states[:, :, :, rollback_dfs] → ssm_state[il]
+//       via a single f16→f32 kernel launch (dflash27b_launch_f16_to_f32).
+//   (b) Conv: copy the (K-1) most recent conv_input slots along the accepted
+//       node's ANCESTRY into conv_state[il]. Pure-chain fast path uses one
+//       cudaMemcpy2DAsync over 3 contiguous slots; sibling-accept path walks
+//       the parent chain one column at a time.
+//
+// Caller must:
+//   - Set cache.cur_pos = pre_pos + commit_count after this returns
+//   - For sibling accepts also compact KV cache slots (not implemented here;
+//     we detect and fall back to sequential catch-up)
+//
+// Returns true iff fast rollback was performed. On sibling-accept paths the
+// caller may prefer the simpler sequential catch-up.
+static bool ddtree_fast_rollback_target(
+    StepGraph & sg, TargetCache & cache,
+    const std::vector<int> & accepted,
+    const DDTree & tree,
+    int commit_count,
+    bool walked_sibling)
+{
+    const int n_delta = (int)sg.delta_captures.size();
+    if (n_delta == 0) return false;
+    if (commit_count <= 0) return false;
+
+    const int rollback_dfs = accepted[commit_count - 1];
+    cudaStream_t stream = nullptr;  // default stream
+
+    for (int il = 0; il < n_delta; il++) {
+        const dflash27b::DeltaNetCapture & cap = sg.delta_captures[il];
+        if (!cap.ssm_intermediate_states || !cap.conv_input) return false;
+
+        // (a) SSM: slot `rollback_dfs` of ssm_intermediate_states (f16 or f32)
+        //     → ssm_state[il] (f32).
+        const size_t ssm_elems =
+            (size_t)cache.ssm_state[il]->ne[0] *
+            (size_t)cache.ssm_state[il]->ne[1] *
+            (size_t)cache.ssm_state[il]->ne[2];
+        const size_t ssm_src_offset =
+            (size_t)rollback_dfs * cap.ssm_intermediate_states->nb[3];
+        const void * ssm_src =
+            (const char *)cap.ssm_intermediate_states->data + ssm_src_offset;
+        if (cap.ssm_intermediate_states->type == GGML_TYPE_F16) {
+            dflash27b_launch_f16_to_f32(ssm_src, cache.ssm_state[il]->data,
+                                        ssm_elems, stream);
+        } else {
+            // F32: plain memcpy.
+            cudaError_t ce = cudaMemcpyAsync(cache.ssm_state[il]->data, ssm_src,
+                                             ssm_elems * sizeof(float),
+                                             cudaMemcpyDeviceToDevice, stream);
+            if (ce != cudaSuccess) {
+                std::fprintf(stderr, "fast rollback ssm il=%d: %s\n",
+                             il, cudaGetErrorString(ce));
+                return false;
+            }
+        }
+
+        // (b) Conv rollback: (K-1)=3 contiguous slots along ancestry.
+        const int K_conv = 4;
+        const int row_cnt = (int)cap.conv_input->ne[1];
+        const size_t elt = ggml_element_size(cap.conv_input);
+        const size_t dpitch = (size_t)(K_conv - 1) * elt;
+        const size_t spitch = cap.conv_input->nb[1];
+
+        if (!walked_sibling) {
+            // Fast path: conv window is 3 contiguous slots ending at rollback_dfs.
+            const int conv_off = rollback_dfs + 1;
+            const void * conv_src =
+                (const char *)cap.conv_input->data + (size_t)conv_off * elt;
+            cudaError_t ce = cudaMemcpy2DAsync(cache.conv_state[il]->data, dpitch,
+                                               conv_src, spitch,
+                                               (size_t)(K_conv - 1) * elt, row_cnt,
+                                               cudaMemcpyDeviceToDevice, stream);
+            if (ce != cudaSuccess) {
+                std::fprintf(stderr, "fast rollback conv il=%d: %s\n",
+                             il, cudaGetErrorString(ce));
+                return false;
+            }
+        } else {
+            // Sibling path: walk parent chain for (K-1) predecessors.
+            int virt[K_conv - 1];
+            virt[K_conv - 2] = rollback_dfs;
+            for (int m = K_conv - 3; m >= 0; m--) {
+                const int prev = virt[m + 1];
+                virt[m] = (prev >= 0) ? (int)tree.parents[prev] : (prev - 1);
+            }
+            for (int m = 0; m < K_conv - 1; m++) {
+                const int sx_slot = (K_conv - 1) + virt[m];
+                const void * src_col =
+                    (const char *)cap.conv_input->data + (size_t)sx_slot * elt;
+                char * dst_col =
+                    (char *)cache.conv_state[il]->data + (size_t)m * elt;
+                cudaError_t ce = cudaMemcpy2DAsync(dst_col, dpitch,
+                                                   src_col, spitch,
+                                                   elt, row_cnt,
+                                                   cudaMemcpyDeviceToDevice, stream);
+                if (ce != cudaSuccess) {
+                    std::fprintf(stderr, "fast rollback sib il=%d m=%d: %s\n",
+                                 il, m, cudaGetErrorString(ce));
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -898,6 +1027,10 @@ int main(int argc, char ** argv) {
         int32_t t_pred = -1;           // target's correction at first mismatch (chain)
         int32_t next_last_tok = -1;    // last_tok carry for next round
         std::vector<int32_t> accepted_tokens;  // tokens in order, length commit_count
+        // DDTree scratch (populated only in VERIFY_DDTREE branch, used by
+        // the fast-rollback path below).
+        DDTree ddtree_tree;
+        std::vector<int> ddtree_accepted;
         if (verify_mode == VERIFY_BATCH) {
             verify_in[0] = last_tok;
             for (int i = 1; i < N_spec; i++) verify_in[i] = drafts[i - 1];
@@ -949,8 +1082,9 @@ int main(int argc, char ** argv) {
             next_last_tok = (k < N_spec) ? t_pred : drafts[N_spec - 1];
         } else if (verify_mode == VERIFY_DDTREE) {
             // Build best-first branching tree from draft's per-position top-K.
-            DDTree tree = build_ddtree(ddtree_logp.data(), ddtree_toks.data(),
+            ddtree_tree = build_ddtree(ddtree_logp.data(), ddtree_toks.data(),
                                        L_ddtree, ddtree_K, ddtree_budget, /*chain_seed=*/true);
+            DDTree & tree = ddtree_tree;
             const int N = 1 + tree.n_nodes;  // root + tree nodes
             // Flat tokens: slot 0 = root (= last_tok), slots 1..N-1 = tree nodes.
             std::vector<int32_t> flat_tokens(N);
@@ -981,13 +1115,13 @@ int main(int argc, char ** argv) {
             c_tgt.cur_pos = pre_pos + N;
             // Walk tree following target's argmax at each slot.
             int next_tok_w = -1;
-            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_tok_w);
-            const int accept_depth = (int)accepted.size();  // includes root
+            ddtree_accepted = follow_verified_tree(tree, posterior.data(), next_tok_w);
+            const int accept_depth = (int)ddtree_accepted.size();  // includes root
             k = accept_depth - 1;  // matched children (for stats)
             commit_count = accept_depth;
             accepted_tokens.resize(commit_count);
             for (int i = 0; i < commit_count; i++) {
-                const int dfs_idx = accepted[i];
+                const int dfs_idx = ddtree_accepted[i];
                 accepted_tokens[i] = (dfs_idx == 0) ? last_tok : tree.token_ids[dfs_idx - 1];
             }
             next_last_tok = next_tok_w;
@@ -1029,29 +1163,76 @@ int main(int argc, char ** argv) {
                 cache.cur_pos = pre_pos + i + 1;
             }
         };
-        // Chain modes: draft cache is at pre_pos + N_spec; target cache is at
-        // pre_pos + N_spec (batched) or pre_pos + commit_count (seq). Catch up
-        // iff commit_count differs from where the cache sits, OR if the
-        // accepted prefix diverges from the linear draft chain.
-        // DDTree mode: target cache is at pre_pos + N (tree size, generally
-        // != commit_count), and draft cache is at pre_pos + N_spec. Always
-        // catch up both to pre_pos + commit_count.
         bool accepted_matches_chain = true;
         for (int i = 1; i < commit_count; i++) {
             if (accepted_tokens[i] != drafts[i - 1]) { accepted_matches_chain = false; break; }
         }
-        bool draft_needs_catchup, tgt_needs_catchup;
-        if (verify_mode == VERIFY_DDTREE) {
-            draft_needs_catchup = true;
-            tgt_needs_catchup   = true;
-        } else {
-            draft_needs_catchup = (commit_count < N_spec) || !accepted_matches_chain;
-            tgt_needs_catchup   = use_batched_verify &&
-                                  (commit_count < N_spec || !accepted_matches_chain);
-        }
 
-        if (draft_needs_catchup) catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
-        if (tgt_needs_catchup)   catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
+        if (verify_mode == VERIFY_DDTREE) {
+            // DDTree rollback.
+            //
+            // Target (35B, expensive): the verify_tree step wrote KV/SSM/conv
+            // state for all N = 1 + tree.n_nodes flat tree slots into cache.
+            // We want the cache at state "processed accepted_tokens only".
+            //
+            //   - Chain walk (accepted[i] == i for i < commit_count AND no
+            //     accepted DFS index exceeds L_ddtree = N_spec): spine KV
+            //     slots [0..commit_count-1] are already the accepted tokens.
+            //     Truncate cur_pos and use fast CUDA rollback for SSM + conv.
+            //     Skips ~commit_count sequential step_model calls at target
+            //     size — the whole DDTree throughput win.
+            //   - Sibling walk (any accepted DFS index > L_ddtree OR any
+            //     accepted[i] != i): KV slots along accepted path are
+            //     scattered; compaction would work but isn't implemented.
+            //     Fall back to sequential catch-up.
+            // Sibling detection: any accepted[i] != i. The chain-seeded build
+            // places spine at DFS slots [1..L], so a walk that stays on spine
+            // has accepted[i] == i for every i. A sibling pop lands in a slot
+            // beyond L, making accepted[i] != i at that depth.
+            bool walked_sibling = false;
+            for (size_t ii = 0; ii < ddtree_accepted.size(); ii++) {
+                if (ddtree_accepted[ii] != (int)ii) { walked_sibling = true; break; }
+            }
+
+            bool fast_ok = false;
+            if (!walked_sibling && commit_count > 0) {
+                fast_ok = ddtree_fast_rollback_target(
+                    sg_tgt, c_tgt, ddtree_accepted, ddtree_tree,
+                    commit_count, /*walked_sibling=*/false);
+                if (fast_ok) c_tgt.cur_pos = pre_pos + commit_count;
+            }
+            if (!fast_ok) catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
+
+            // Draft (0.8B, cheap): if accepted path == draft top-1 chain and
+            // commit_count <= N_spec, draft cache already embodies the right
+            // state at pre_pos + N_spec; rewind by snapshot restore + replay
+            // up to commit_count. The replay is fast at draft size.
+            // For the commit_count == N_spec + 1 case (full chain + bonus
+            // tip), draft only needs one extra step (feed drafts[N_spec-1]).
+            if (accepted_matches_chain && commit_count == N_spec + 1) {
+                (void)step_model(w_drf, c_drf, backend, sg_drf,
+                                 drafts[N_spec - 1], pre_pos + N_spec,
+                                 embed_drf, logits_drf);
+                c_drf.cur_pos = pre_pos + N_spec + 1;
+            } else if (accepted_matches_chain && commit_count == N_spec) {
+                // Draft cache already at pre_pos + N_spec = pre_pos + commit_count.
+            } else {
+                catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
+            }
+        } else {
+            // Chain modes: draft cache is at pre_pos + N_spec; target cache
+            // is at pre_pos + N_spec (batched) or pre_pos + commit_count
+            // (seq). Catch up iff commit_count differs from where the cache
+            // sits, OR if the accepted prefix diverges from the linear draft
+            // chain.
+            const bool draft_needs_catchup =
+                (commit_count < N_spec) || !accepted_matches_chain;
+            const bool tgt_needs_catchup =
+                use_batched_verify &&
+                (commit_count < N_spec || !accepted_matches_chain);
+            if (draft_needs_catchup) catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
+            if (tgt_needs_catchup)   catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
+        }
 
         last_tok = next_last_tok;
         n_rounds++;

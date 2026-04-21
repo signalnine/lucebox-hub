@@ -110,6 +110,10 @@ if(DFLASH27B_TESTS)
         add_executable(test_chain_spec test/test_chain_spec.cpp)
         target_include_directories(test_chain_spec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_chain_spec PRIVATE dflash27b ggml ggml-cuda)
+        # test_chain_spec uses cudaMemcpyAsync / cudaMemcpy2DAsync directly for
+        # the DDTree fast-rollback path. Link the CUDA runtime explicitly.
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test_chain_spec PRIVATE CUDA::cudart)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
         add_executable(test_dflash test/test_dflash.cpp)
