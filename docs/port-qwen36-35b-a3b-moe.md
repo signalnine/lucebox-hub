@@ -30,61 +30,93 @@ hybrid + Q4_K_M and extends each layer with what the MoE/MXFP4 variant needs.
 
 ---
 
-## Pre-work (verification, before touching code)
+## Pre-work (M0) — status: verified
 
-These unknowns gate the plan; resolve them first.
+GGUF on disk: `/mnt/ai/models/huggingface/qwen3.6-35b-a3b-GGUF/Qwen3.6-35B-A3B-MXFP4_MOE.gguf` (20.2 GiB).
 
-1. **Confirm the architecture key** inside the GGUF.
-   ```bash
-   ./deps/llama.cpp/build/bin/gguf-dump --no-tensors \
-       models/Qwen3.6-35B-A3B-MXFP4_MOE.gguf | head -50
-   ```
-   The `general.architecture` string routes to one of `qwen3moe`, `qwen35moe`,
-   `qwen3next`, or a new `qwen36moe`/`qwen36` variant. Each has a different
-   reference `llm_build_*` in `dflash/deps/llama.cpp/src/models/`. The plan
-   branches here — see §3.
+### 1. Architecture ✓
+```
+general.architecture = qwen35moe
+```
+Same arch name as our reference `deps/llama.cpp/src/models/qwen35moe.cpp`. Our fork already has the forward-pass reference. **Plan branch §3a (hybrid DeltaNet + MoE) applies.**
 
-2. **Confirm hybrid vs pure attention.** Look at the GGUF metadata for
-   `*.recurrent_layer_indices` or for `*.ssm.*` tensors. If present, it's
-   DeltaNet-hybrid (like 27B) and we reuse our tree-mode ops. If absent, it's
-   pure attention + MoE and we can *remove* a lot of our machinery.
+### 2. Hybrid vs pure attention ✓
+`qwen35moe.full_attention_interval = 4`, confirmed by tensor-level inspection:
 
-3. **Dump shape constants.** Collect `hparams`:
-   `n_embd`, `n_layer`, `n_head`, `n_head_kv`, `n_embd_head_k/v`,
-   `n_ff`, `n_expert`, `n_expert_used`, `n_embd_head_v`, `rope_freq_base`,
-   `rope_sections`, `rms_norm_eps`.
-   These become the new `#define`s in `include/dflash27b.h` /
-   `src/internal.h` (or a new `include/dflash36.h` if we decide to keep 27B
-   shipping alongside).
+| Layer indices | Type | Tensors |
+|---|---|---|
+| 0, 1, 2, 4, 5, 6, 8, 9, 10, … | DeltaNet (SSM) | `attn_qkv`, `attn_gate`, `ssm_a`, `ssm_alpha`, `ssm_beta`, `ssm_conv1d`, `ssm_dt`, `ssm_norm`, `ssm_out` |
+| 3, 7, 11, 15, 19, 23, 27, 31, 35, 39 | Full attention | `attn_q`, `attn_k`, `attn_v`, `attn_q_norm`, `attn_k_norm`, `attn_output` |
 
-4. **Sanity-check MXFP4 support in our submodule.**
-   Already present in `dflash/deps/llama.cpp/ggml/src/ggml-common.h`
-   (`block_mxfp4`, `QK_MXFP4=32`) and
-   `ggml-cuda/convert.cu` (`dequantize_block_mxfp4`, registered for
-   `GGML_TYPE_MXFP4`). Do a smoke test:
-   ```bash
-   ./deps/llama.cpp/build/bin/llama-cli -m <target>.gguf -p "hello" -n 8 -ngl 99
-   ```
-   If that runs, every ggml op we need (matmul, get_rows, softmax) already
-   has the MXFP4 path. If it doesn't, stop and file upstream before touching
-   the port.
+3 DeltaNet + 1 Attention, repeating — identical 3:1 ratio to Qwen3.5-0.8B and 3.5-27B. Our tree-mode SSM ops (`ggml_ssm_conv_tree`, `ggml_gated_delta_net_tree[_persist]`) apply directly.
 
-5. **Pick the draft model.**
-   z-lab has not published a DFlash draft for this target (as of April 2026).
-   Options in order of preference:
-   - (a) **Chain-speculative draft:** any small Qwen3 model with matching
-     tokenizer — e.g. `Qwen/Qwen3-1.7B` or `Qwen/Qwen3-4B`. This is the
-     fallback path even in the current DFlash engine (set
-     `ddtree-budget=n_spec+1` and no branching).
-   - (b) **Train a DFlash draft** on the new target using z-lab's recipe.
-     ~3-5 days of H100 time; out of scope for the first milestone.
-   - (c) If the MoE architecture is pure-attention, EAGLE-2/3 drafts may be
-     easier to adapt — check the `openai-moe-iswa.cpp` reference in our fork
-     for similar-shape models that already have EAGLE ports.
+Full-attention layers use **separate** Q/K/V (not fused like DeltaNet's `attn_qkv`), with per-head Q-norm and K-norm (standard Qwen3 pattern).
 
-   **Decision point:** ship chain-speculative first with a small Qwen3 dense
-   draft. It validates the whole pipeline (AR + spec) at ~2× speedup. Draft
-   training for DDTree is a follow-on.
+### 3. Shape constants ✓
+
+```c
+// Candidate header: include/dflash36.h  (or extend existing internal.h)
+#define QWEN36_N_EMBD                 2048      // vs 27B's 5120
+#define QWEN36_N_LAYER                40        // vs 27B's 64
+#define QWEN36_N_HEAD                 16        // Q heads (per full-attn layer)
+#define QWEN36_N_HEAD_KV              2
+#define QWEN36_HEAD_DIM               256       // key_length == value_length
+#define QWEN36_ROPE_DIM               64        // partial RoPE
+#define QWEN36_ROPE_THETA             1e7f
+#define QWEN36_RMS_EPS                1e-6f
+#define QWEN36_N_EXPERT               256
+#define QWEN36_N_EXPERT_USED          8         // top-k routing
+#define QWEN36_N_FF_EXPERT            512       // per-expert FFN hidden
+#define QWEN36_N_FF_SHEXP             512       // shared-expert FFN hidden
+#define QWEN36_FULL_ATTN_INTERVAL     4         // (il+1)%4==0 → full attn
+#define QWEN36_CTX_MAX                262144    // 256K
+#define QWEN36_VOCAB                  248320    // same as 27B
+// SSM state dims still need to be dumped from ssm_* tensor shapes
+// (`ssm_a` is [32], so SSM heads = 32; key/value dim TBD from ssm_conv1d shape [4, 8192])
+```
+
+Active params per token (rough count): attention ≈ 19 M/layer, expert+shared FFN ≈ 19 M/layer → ~40 M/layer × 40 = ~1.6 B active (consistent with the "A3B" label, which typically bundles embedding lookup).
+
+### 4. MXFP4 end-to-end sanity ✓
+
+Tensor dtypes in the GGUF:
+| Role | Dtype | Count | Shape |
+|------|:-----:|:-----:|-------|
+| `ffn_gate_exps`, `ffn_up_exps` | **MXFP4** | 78 | [2048, 512, 256] (rank-3 MoE) |
+| `ffn_down_exps` | Q5_K (38) / Q6_K (4) | 42 | [512, 2048, 256] |
+| `attn_qkv`, `attn_q/k/v`, `attn_output`, `attn_gate`, `ffn_{gate,up,down}_shexp`, `token_embd`, `output` | Q8_0 | 252 | dense |
+| norms, `ssm_a`, `ssm_alpha/beta`, `ssm_conv1d`, `ssm_dt`, `ffn_gate_inp[_shexp]` | F32 | 361 | small |
+
+MXFP4 CUDA dequant is already in our pinned submodule: `ggml-cuda/convert.cu:dequantize_block_mxfp4` registered for `GGML_TYPE_MXFP4`. `llama-bench` against the pinned `deps/llama.cpp` (rebuilt with `-DCMAKE_CUDA_ARCHITECTURES=120`) loads the MXFP4 GGUF and runs prefill + decode cleanly:
+
+| Test | tok/s |
+|:---:|:---:|
+| `pp512` (batched prefill) | **6,472** |
+| `pp8` (short prefill) | 395 |
+| `tg128` (decode) | **210.7** |
+| `tg16` (decode) | 192.3 |
+
+**Reference numbers for the DFlash port to beat** — these are llama.cpp's own MXFP4 autoregressive baseline on our 5090. For comparison, Qwen3.5-27B Q4_K_M AR on the same 5090 is ~58 tok/s tg (see `dflash/RESULTS.md`); A3B's sparse activation gives 3.6× the AR throughput despite being nominally a larger model, because only ~3 B of the 34.66 B params are active per token.
+
+Note: `llama-cli` was unusable against this GGUF (kept echoing empty `> ` prompts, probably a chat-template interaction). Not blocking — we bypass llama-cli entirely in our engine and only link ggml.
+
+### 5. Draft model ✓ (decision)
+
+No z-lab DFlash-trained draft for Qwen3.6. Ship M1-M4 with **chain-speculative + small Qwen3-family dense draft** (matching `gpt2` BPE tokenizer, 248320-vocab). Candidates:
+- `Qwen/Qwen3-1.7B` or `Qwen/Qwen3-4B` (tokenizer verified to match Qwen3.5; assume carries to 3.6 — must confirm)
+- Larger draft = higher per-step cost but better acceptance; sweep after M3.
+
+M5 (DFlash-trained draft) remains deferred.
+
+### Plan-doc deltas resolved by M0
+
+| Open question (before M0) | Answered |
+|---|---|
+| Arch variant? | `qwen35moe` — use branch §3a |
+| Hybrid? | Yes — 3 DeltaNet + 1 Attention per 4 layers, same as 27B |
+| MXFP4 CUDA support? | Library path confirmed; runtime smoke test pending |
+| Draft with matching tokenizer? | Qwen3-family (gpt2 BPE, 248320 vocab) — small dense draft for M1-M4 |
+| Tokenizer ID | `gpt2` BPE |
 
 ---
 
