@@ -89,7 +89,410 @@ __global__ void pf_silu_mul_bf16(const __nv_bfloat16 *gate, const __nv_bfloat16 
     if (i < N) { float g = __bfloat162float(gate[i]); out[i] = __float2bfloat16(pf_silu(g) * __bfloat162float(up[i])); }
 }
 
-// ===== Standalone DeltaNet recurrence (state-in-registers, bf16 I/O, f32 state) =====
+// ===== V-sharded DeltaNet recurrence (axp) =====
+//
+// The original `pf_deltanet_recurrence` launches 16 blocks (one per head),
+// filling only 16/170 = 9% of a 5090's SMs and bottlenecking prefill at 80%
+// of total time. This refactor splits it into three kernels whose launch
+// grids actually fit modern high-SM-count cards:
+//
+//   1. `pf_deltanet_conv_norm`  — 16 blocks (1/head). Does the conv1d
+//      window shift + SiLU + L2-norm + beta/decay activation. Writes
+//      per-token Q, K, V (post-norm) to global.
+//   2. `pf_deltanet_state`      — 16 * N_V_CHUNKS blocks. Owns a V-stripe
+//      of state in registers, reads Q/K/V broadcasts from global.
+//   3. `pf_deltanet_gated_rmsnorm` — S*H blocks. One per (token, head);
+//      computes RMS over the 128-element V, applies gated SiLU(z_proj).
+//
+// N_V_CHUNKS=4 is the first step: 16 → 64 blocks (40% of SMs on 5090 if
+// they can coexist; compiler decides occupancy).
+
+#define N_V_CHUNKS 8
+#define V_STRIPE   (DN_VAL / N_V_CHUNKS)           // 16
+#define STATE_BS   128                              // block size for state kernel
+#define STATE_NW   (STATE_BS / 32)                  // 4 warps
+#define STATE_CPW  (V_STRIPE / STATE_NW)            // 4
+
+// Kernel 1a: standard 1D conv over (time, channel). Fully parallel, no serial
+// dependency across tokens — the only cross-token state is the conv history
+// (the 3 most recent samples from the previous call), which is read-only
+// within this kernel. Output is post-SiLU raw channel values.
+__global__ void pf_conv1d_parallel(
+    const __nv_bfloat16 *qkv_proj,    // [S, DN_CONV_CH]
+    const float *conv_buf_in,         // [DN_CONV_CH, DN_CONV_K]  — history from prior call
+    const __nv_bfloat16 *conv_w,      // [DN_CONV_CH, DN_CONV_K]
+    __nv_bfloat16 *conv_out,          // [S, DN_CONV_CH]  — post-SiLU raw (pre-norm)
+    int S)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = S * DN_CONV_CH;
+    if (idx >= total) return;
+    int t  = idx / DN_CONV_CH;
+    int ch = idx % DN_CONV_CH;
+
+    float w0 = __bfloat162float(__ldg(conv_w + ch*DN_CONV_K + 0));
+    float w1 = __bfloat162float(__ldg(conv_w + ch*DN_CONV_K + 1));
+    float w2 = __bfloat162float(__ldg(conv_w + ch*DN_CONV_K + 2));
+    float w3 = __bfloat162float(__ldg(conv_w + ch*DN_CONV_K + 3));
+
+    auto sample = [&](int tp) -> float {
+        if (tp < 0) {
+            // History layout after a prior call: conv_buf_in[ch, 0..3] holds
+            // samples at times -4, -3, -2, -1. We need sample[-3..-1] here.
+            return conv_buf_in[ch*DN_CONV_K + (tp + 4)];
+        }
+        return __bfloat162float(qkv_proj[tp*DN_CONV_CH + ch]);
+    };
+
+    float s0 = sample(t - 3);
+    float s1 = sample(t - 2);
+    float s2 = sample(t - 1);
+    float s3 = __bfloat162float(qkv_proj[t*DN_CONV_CH + ch]);  // t-0 always in-range
+
+    float co = s0*w0 + s1*w1 + s2*w2 + s3*w3;
+    conv_out[t*DN_CONV_CH + ch] = __float2bfloat16(pf_silu(co));
+}
+
+// Kernel 1b: save the last 4 qkv samples into conv_buf for the NEXT call.
+// Only needs enough threads to cover DN_CONV_CH channels.
+__global__ void pf_conv_buf_save(
+    const __nv_bfloat16 *qkv_proj,    // [S, DN_CONV_CH]
+    float *conv_buf_out,              // [DN_CONV_CH, DN_CONV_K]
+    int S)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= DN_CONV_CH) return;
+    // Persist samples at times S-4, S-3, S-2, S-1. Clamp if S < 4.
+    for (int k = 0; k < DN_CONV_K; k++) {
+        int t = S - DN_CONV_K + k;
+        float v = (t >= 0) ? __bfloat162float(qkv_proj[t*DN_CONV_CH + ch])
+                           : conv_buf_out[ch*DN_CONV_K + k];   // preserve if S too small
+        conv_buf_out[ch*DN_CONV_K + k] = v;
+    }
+}
+
+// Kernel 1c: per (token, head) L2-normalize Q and K, passthrough V, compute
+// beta/decay. One block per (t, h). Small, high parallelism (S*H = 8320 on 5090).
+__global__ void pf_deltanet_norm_activate(
+    const __nv_bfloat16 *conv_out,    // [S, DN_CONV_CH]  — post-SiLU, pre-norm (from 1a)
+    const __nv_bfloat16 *a_log,       // [DN_HEADS]
+    const __nv_bfloat16 *dt_bias,     // [DN_HEADS]
+    __nv_bfloat16 *s_q_out,           // [S, DN_HEADS, DN_KEY]
+    __nv_bfloat16 *s_k_out,           // [S, DN_HEADS, DN_KEY]
+    __nv_bfloat16 *s_v_out,           // [S, DN_HEADS, DN_VAL]
+    float *beta_buf,                  // [S, DN_HEADS]
+    float *decay_buf,                 // [S, DN_HEADS]
+    int S)
+{
+    int idx = blockIdx.x;
+    int t = idx / DN_HEADS;
+    int h = idx % DN_HEADS;
+    if (t >= S) return;
+
+    int tid = threadIdx.x;
+    int lid = tid % 32, wid = tid / 32;
+    constexpr int NW = 4;  // blockDim.x = 128
+    constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY];
+
+    // Load Q channels (post-silu), compute L2 sum in same pass
+    const __nv_bfloat16 *q_in = conv_out + t*DN_CONV_CH + h*DN_KEY;
+    const __nv_bfloat16 *k_in = conv_out + t*DN_CONV_CH + DN_QK_SIZE + h*DN_KEY;
+    const __nv_bfloat16 *v_in = conv_out + t*DN_CONV_CH + 2*DN_QK_SIZE + h*DN_VAL;
+
+    float sq_q = 0, sq_k = 0;
+    for (int c = tid; c < DN_KEY; c += blockDim.x) {
+        float qv = __bfloat162float(q_in[c]); s_q[c] = qv; sq_q += qv*qv;
+        float kv = __bfloat162float(k_in[c]); s_k[c] = kv; sq_k += kv*kv;
+    }
+    sq_q = pf_warp_sum(sq_q);
+    sq_k = pf_warp_sum(sq_k);
+
+    __shared__ float sm_qnorm[NW], sm_knorm[NW];
+    if (lid == 0) { sm_qnorm[wid] = sq_q; sm_knorm[wid] = sq_k; }
+    __syncthreads();
+    if (wid == 0) {
+        float vq = (lid < NW) ? sm_qnorm[lid] : 0;
+        float vk = (lid < NW) ? sm_knorm[lid] : 0;
+        vq = pf_warp_sum(vq); vk = pf_warp_sum(vk);
+        if (lid == 0) {
+            sm_qnorm[0] = rsqrtf(vq + 1e-6f) * Q_SCALE;
+            sm_knorm[0] = rsqrtf(vk + 1e-6f);
+        }
+    }
+    __syncthreads();
+    float nq = sm_qnorm[0], nk = sm_knorm[0];
+
+    __nv_bfloat16 *q_out = s_q_out + t*DN_QK_SIZE + h*DN_KEY;
+    __nv_bfloat16 *k_out = s_k_out + t*DN_QK_SIZE + h*DN_KEY;
+    for (int c = tid; c < DN_KEY; c += blockDim.x) {
+        q_out[c] = __float2bfloat16(s_q[c] * nq);
+        k_out[c] = __float2bfloat16(s_k[c] * nk);
+    }
+    // V is passthrough (no normalization)
+    __nv_bfloat16 *v_out = s_v_out + t*DN_V_SIZE + h*DN_VAL;
+    for (int c = tid; c < DN_VAL; c += blockDim.x) {
+        v_out[c] = v_in[c];
+    }
+
+    // Beta and decay (per (t, h)): single thread per block
+    if (tid == 0) {
+        float bv = beta_buf[t*DN_HEADS + h];
+        beta_buf[t*DN_HEADS + h] = 1.f / (1.f + expf(-bv));
+        float a_log_val = __bfloat162float(__ldg(a_log + h));
+        float dt_b      = __bfloat162float(__ldg(dt_bias + h));
+        float x = decay_buf[t*DN_HEADS + h] + dt_b;
+        float sp = (x > 20.f) ? x : logf(1.f + expf(x));
+        decay_buf[t*DN_HEADS + h] = expf(-expf(a_log_val) * sp);
+    }
+}
+
+// Kernel 1 (legacy, kept for reference): serial-per-head conv+norm+activate.
+// Superseded by the three parallel kernels above. Can be removed once the
+// new path is validated on 3090 too.
+__global__ void __launch_bounds__(128, 4)
+pf_deltanet_conv_norm(
+    const __nv_bfloat16 *qkv_proj,   // [S, DN_CONV_CH]  — raw cuBLAS output
+    const __nv_bfloat16 *conv_w,     // [DN_CONV_CH, DN_CONV_K]
+    const __nv_bfloat16 *a_log,      // [DN_HEADS]
+    const __nv_bfloat16 *dt_bias,    // [DN_HEADS]
+    float *conv_buf,                 // [DN_CONV_CH, DN_CONV_K]  — updated in place
+    __nv_bfloat16 *s_q_out,          // [S, DN_HEADS, DN_KEY]    — post-norm Q
+    __nv_bfloat16 *s_k_out,          // [S, DN_HEADS, DN_KEY]    — post-norm K
+    __nv_bfloat16 *s_v_out,          // [S, DN_HEADS, DN_VAL]    — post-silu V
+    float *beta_buf,                 // [S, DN_HEADS]            — in place: raw→sigmoid
+    float *decay_buf,                // [S, DN_HEADS]            — in place: raw→decay
+    int S)
+{
+    int h = blockIdx.x; if (h >= DN_HEADS) return;
+    int tid = threadIdx.x;
+    int lid = tid % 32, wid = tid / 32;
+    constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+
+    float a_log_val = __bfloat162float(a_log[h]);
+    float dt_b      = __bfloat162float(dt_bias[h]);
+
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[DN_VAL];
+
+    for (int t = 0; t < S; t++) {
+        // Q channels
+        for (int c = tid; c < DN_KEY; c += blockDim.x) {
+            int ch = h*DN_KEY + c;
+            float h0 = conv_buf[ch*DN_CONV_K+1], h1 = conv_buf[ch*DN_CONV_K+2], h2 = conv_buf[ch*DN_CONV_K+3];
+            conv_buf[ch*DN_CONV_K]   = h0;
+            conv_buf[ch*DN_CONV_K+1] = h1;
+            conv_buf[ch*DN_CONV_K+2] = h2;
+            conv_buf[ch*DN_CONV_K+3] = __bfloat162float(qkv_proj[t*DN_CONV_CH + ch]);
+            float co = 0;
+            #pragma unroll
+            for (int k = 0; k < DN_CONV_K; k++)
+                co += conv_buf[ch*DN_CONV_K+k] * __bfloat162float(__ldg(conv_w + ch*DN_CONV_K+k));
+            s_q[c] = pf_silu(co);
+        }
+        // K channels
+        for (int c = tid; c < DN_KEY; c += blockDim.x) {
+            int ch = DN_QK_SIZE + h*DN_KEY + c;
+            float h0 = conv_buf[ch*DN_CONV_K+1], h1 = conv_buf[ch*DN_CONV_K+2], h2 = conv_buf[ch*DN_CONV_K+3];
+            conv_buf[ch*DN_CONV_K]   = h0;
+            conv_buf[ch*DN_CONV_K+1] = h1;
+            conv_buf[ch*DN_CONV_K+2] = h2;
+            conv_buf[ch*DN_CONV_K+3] = __bfloat162float(qkv_proj[t*DN_CONV_CH + ch]);
+            float co = 0;
+            #pragma unroll
+            for (int k = 0; k < DN_CONV_K; k++)
+                co += conv_buf[ch*DN_CONV_K+k] * __bfloat162float(__ldg(conv_w + ch*DN_CONV_K+k));
+            s_k[c] = pf_silu(co);
+        }
+        // V channels
+        for (int c = tid; c < DN_VAL; c += blockDim.x) {
+            int ch = 2*DN_QK_SIZE + h*DN_VAL + c;
+            float h0 = conv_buf[ch*DN_CONV_K+1], h1 = conv_buf[ch*DN_CONV_K+2], h2 = conv_buf[ch*DN_CONV_K+3];
+            conv_buf[ch*DN_CONV_K]   = h0;
+            conv_buf[ch*DN_CONV_K+1] = h1;
+            conv_buf[ch*DN_CONV_K+2] = h2;
+            conv_buf[ch*DN_CONV_K+3] = __bfloat162float(qkv_proj[t*DN_CONV_CH + ch]);
+            float co = 0;
+            #pragma unroll
+            for (int k = 0; k < DN_CONV_K; k++)
+                co += conv_buf[ch*DN_CONV_K+k] * __bfloat162float(__ldg(conv_w + ch*DN_CONV_K+k));
+            s_v[c] = pf_silu(co);
+        }
+        __syncthreads();
+
+        // L2-normalize Q (warp 0) and K (warp 1)
+        if (wid == 0) {
+            float sq = 0;
+            for (int i = lid; i < DN_KEY; i += 32) sq += s_q[i]*s_q[i];
+            sq = pf_warp_sum(sq);
+            float n = rsqrtf(sq + 1e-6f) * Q_SCALE;
+            n = __shfl_sync(0xffffffff, n, 0);
+            for (int i = lid; i < DN_KEY; i += 32) s_q[i] *= n;
+        }
+        if (wid == 1) {
+            float sq = 0;
+            for (int i = lid; i < DN_KEY; i += 32) sq += s_k[i]*s_k[i];
+            sq = pf_warp_sum(sq);
+            float n = rsqrtf(sq + 1e-6f);
+            n = __shfl_sync(0xffffffff, n, 0);
+            for (int i = lid; i < DN_KEY; i += 32) s_k[i] *= n;
+        }
+        __syncthreads();
+
+        // Store Q, K, V to global in BF16
+        for (int c = tid; c < DN_KEY; c += blockDim.x)
+            s_q_out[t*DN_QK_SIZE + h*DN_KEY + c] = __float2bfloat16(s_q[c]);
+        for (int c = tid; c < DN_KEY; c += blockDim.x)
+            s_k_out[t*DN_QK_SIZE + h*DN_KEY + c] = __float2bfloat16(s_k[c]);
+        for (int c = tid; c < DN_VAL; c += blockDim.x)
+            s_v_out[t*DN_V_SIZE + h*DN_VAL + c] = __float2bfloat16(s_v[c]);
+
+        // Transform beta (sigmoid) and alpha (softplus → decay) in place
+        if (tid == 0) {
+            float bv = beta_buf[t*DN_HEADS + h];
+            beta_buf[t*DN_HEADS + h] = 1.f / (1.f + expf(-bv));
+            float x = decay_buf[t*DN_HEADS + h] + dt_b;
+            float sp = (x > 20.f) ? x : logf(1.f + expf(x));
+            decay_buf[t*DN_HEADS + h] = expf(-expf(a_log_val) * sp);
+        }
+        __syncthreads();
+    }
+}
+
+// Kernel 2: V-sharded state update. Reads broadcast Q/K/V from global,
+// owns state[head, v_chunk*STRIPE..+STRIPE, :] in registers.
+__global__ void __launch_bounds__(STATE_BS, 4)
+pf_deltanet_state(
+    const __nv_bfloat16 *s_q_in,         // [S, DN_HEADS, DN_KEY]
+    const __nv_bfloat16 *s_k_in,         // [S, DN_HEADS, DN_KEY]
+    const __nv_bfloat16 *s_v_in,         // [S, DN_HEADS, DN_VAL]
+    const float *beta_buf,               // [S, DN_HEADS]
+    const float *decay_buf,              // [S, DN_HEADS]
+    float *state,                        // [DN_HEADS, DN_VAL, DN_KEY]
+    __nv_bfloat16 *out_unnormalized,     // [S, DN_HEADS, DN_VAL]
+    int S)
+{
+    int h       = blockIdx.x / N_V_CHUNKS;
+    int v_chunk = blockIdx.x % N_V_CHUNKS;
+    int j_start = v_chunk * V_STRIPE;
+
+    int tid = threadIdx.x;
+    int lid = tid % 32, wid = tid / 32;
+
+    constexpr int RPL = DN_KEY / 32;      // 4
+
+    __shared__ float s_q[DN_KEY], s_k[DN_KEY], s_v[V_STRIPE];
+    __shared__ float s_beta, s_decay;
+
+    float *my_state = state + h * DN_KEY * DN_VAL;
+
+    // Load our V-stripe of state into registers
+    float sreg[STATE_CPW * RPL];
+    #pragma unroll
+    for (int jj = 0; jj < STATE_CPW; jj++) {
+        int j = j_start + wid * STATE_CPW + jj;
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++)
+            sreg[jj*RPL + ii] = my_state[j*DN_KEY + lid + ii*32];
+    }
+
+    for (int t = 0; t < S; t++) {
+        // Load Q, K (full), and our V-stripe
+        for (int c = tid; c < DN_KEY; c += blockDim.x) {
+            s_q[c] = __bfloat162float(s_q_in[t*DN_QK_SIZE + h*DN_KEY + c]);
+            s_k[c] = __bfloat162float(s_k_in[t*DN_QK_SIZE + h*DN_KEY + c]);
+        }
+        for (int c = tid; c < V_STRIPE; c += blockDim.x) {
+            s_v[c] = __bfloat162float(s_v_in[t*DN_V_SIZE + h*DN_VAL + j_start + c]);
+        }
+        if (tid == 0) {
+            s_beta  = beta_buf [t*DN_HEADS + h];
+            s_decay = decay_buf[t*DN_HEADS + h];
+        }
+        __syncthreads();
+        float beta = s_beta, decay = s_decay;
+
+        __nv_bfloat16 *out_h = out_unnormalized + t * DN_V_SIZE + h * DN_VAL;
+
+        // State update — sharded over V, identical math otherwise
+        #pragma unroll
+        for (int jj = 0; jj < STATE_CPW; jj++) {
+            int j_local = wid * STATE_CPW + jj;
+            int j_abs   = j_start + j_local;
+            float kv = 0;
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) kv += sreg[jj*RPL+ii] * s_k[lid + ii*32];
+            kv = pf_warp_sum(kv);
+            kv = __shfl_sync(0xffffffff, kv, 0);
+            float delta = (s_v[j_local] - decay * kv) * beta;
+            float attn = 0;
+            #pragma unroll
+            for (int ii = 0; ii < RPL; ii++) {
+                sreg[jj*RPL+ii] = decay * sreg[jj*RPL+ii] + s_k[lid + ii*32] * delta;
+                attn += sreg[jj*RPL+ii] * s_q[lid + ii*32];
+            }
+            attn = pf_warp_sum(attn);
+            if (lid == 0) out_h[j_abs] = __float2bfloat16(attn);
+        }
+        __syncthreads();
+    }
+
+    // Write state back
+    #pragma unroll
+    for (int jj = 0; jj < STATE_CPW; jj++) {
+        int j = j_start + wid * STATE_CPW + jj;
+        #pragma unroll
+        for (int ii = 0; ii < RPL; ii++)
+            my_state[j*DN_KEY + lid + ii*32] = sreg[jj*RPL + ii];
+    }
+}
+
+// Kernel 3: Gated RMSNorm. One block per (token, head). 128 threads.
+__global__ void pf_deltanet_gated_rmsnorm(
+    __nv_bfloat16 *output,           // [S, DN_HEADS, DN_VAL] — unnormalized → normalized gated, in place
+    const __nv_bfloat16 *z_proj,     // [S, DN_HEADS, DN_VAL]
+    const __nv_bfloat16 *norm_w,     // [DN_VAL]
+    int S)
+{
+    int idx = blockIdx.x;
+    int t = idx / DN_HEADS;
+    int h = idx % DN_HEADS;
+    if (t >= S) return;
+
+    int tid = threadIdx.x;
+    int lid = tid % 32, wid = tid / 32;
+    constexpr int NW = 4;  // 128/32
+
+    __nv_bfloat16 *out_h = output + t * DN_V_SIZE + h * DN_VAL;
+    const __nv_bfloat16 *z_h = z_proj + t * DN_V_SIZE + h * DN_VAL;
+
+    __shared__ float smem[NW];
+
+    float sq = 0;
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        float v = __bfloat162float(out_h[i]);
+        sq += v * v;
+    }
+    sq = pf_warp_sum(sq);
+    if (lid == 0) smem[wid] = sq;
+    __syncthreads();
+    if (wid == 0) {
+        float v = (lid < NW) ? smem[lid] : 0;
+        v = pf_warp_sum(v);
+        if (lid == 0) smem[0] = rsqrtf(v / DN_VAL + RMS_EPS);
+    }
+    __syncthreads();
+    float rstd = smem[0];
+
+    for (int i = tid; i < DN_VAL; i += blockDim.x) {
+        float n = __bfloat162float(out_h[i]) * rstd * __bfloat162float(__ldg(norm_w + i));
+        out_h[i] = __float2bfloat16(n * pf_silu(__bfloat162float(z_h[i])));
+    }
+}
+
+// ===== Standalone DeltaNet recurrence (legacy: unused on rtx-5090) =====
+// Kept for reference / 3090 fallback. On the rtx-5090 branch the orchestrator
+// calls the three new kernels above instead (axp).
 __global__ void __launch_bounds__(512, 1)
 pf_deltanet_recurrence(
     const __nv_bfloat16 *qkv_proj, const __nv_bfloat16 *z_proj,
@@ -356,6 +759,22 @@ extern "C" void launch_prefill_bf16(
     int S = seq_len;
     int bk = (S*HIDDEN+255)/256;
 
+    // Cached scratch for the V-sharded DeltaNet path (axp): Q, K, V post-norm
+    // broadcasts (per-token, per-head). Allocated once, reused; grows only
+    // when a bigger S comes in. Unnormalized state-kernel output lands in
+    // dn_out_buf and the gated-RMSNorm kernel operates on it in place.
+    static __nv_bfloat16 *dn_qkv_scratch = nullptr;  // [3, S, DN_HEADS, DN_KEY]
+    static int dn_scratch_S = 0;
+    if (S > dn_scratch_S) {
+        if (dn_qkv_scratch) cudaFree(dn_qkv_scratch);
+        size_t qkv_bytes = 3ull * S * DN_QK_SIZE * sizeof(__nv_bfloat16);
+        cudaMalloc(&dn_qkv_scratch, qkv_bytes);
+        dn_scratch_S = S;
+    }
+    __nv_bfloat16 *dn_s_q = dn_qkv_scratch + 0ull * S * DN_QK_SIZE;
+    __nv_bfloat16 *dn_s_k = dn_qkv_scratch + 1ull * S * DN_QK_SIZE;
+    __nv_bfloat16 *dn_s_v = dn_qkv_scratch + 2ull * S * DN_QK_SIZE;
+
     pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
 
     int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
@@ -391,13 +810,37 @@ extern "C" void launch_prefill_bf16(
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, beta_w, beta_buf, S, HIDDEN, DN_HEADS);
             pf_bf16_matvec<<<S*DN_HEADS, 32, 0, stream>>>(normalized, alpha_w, alpha_buf, S, HIDDEN, DN_HEADS);
 
-            // Standalone recurrence
-            pf_deltanet_recurrence<<<DN_HEADS, 512, 0, stream>>>(
-                proj_buf, proj_buf2, beta_buf, alpha_buf,
-                conv_w, a_log, dt_bias, dn_norm,
+            // V-sharded recurrence: 5 kernels for 5090 occupancy (see axp).
+            //   1a. Parallel 1D conv (grid: S*DN_CONV_CH threads)
+            //   1b. Save conv history for next call (cheap, post-conv)
+            //   1c. Per-(t,h) L2 norm Q/K + passthrough V + beta/decay
+            //   2.  V-sharded state update
+            //   3.  Per-(t,h) gated RMSNorm
+            float *conv_buf_layer = conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K;
+            __nv_bfloat16 *conv_out_buf = mlp_buf;  // reused: mlp_buf is idle during DeltaNet phase
+            // 1a: parallel conv1d over (S, channel)
+            int conv1d_threads = 256;
+            int conv1d_blocks  = (S*DN_CONV_CH + conv1d_threads - 1) / conv1d_threads;
+            pf_conv1d_parallel<<<conv1d_blocks, conv1d_threads, 0, stream>>>(
+                proj_buf, conv_buf_layer, conv_w, conv_out_buf, S);
+            // 1b: persist the last 4 samples for the next call
+            int save_threads = 256;
+            int save_blocks  = (DN_CONV_CH + save_threads - 1) / save_threads;
+            pf_conv_buf_save<<<save_blocks, save_threads, 0, stream>>>(
+                proj_buf, conv_buf_layer, S);
+            // 1c: per-(t,h) L2 norm + activate
+            pf_deltanet_norm_activate<<<S * DN_HEADS, 128, 0, stream>>>(
+                conv_out_buf, a_log, dt_bias,
+                dn_s_q, dn_s_k, dn_s_v,
+                beta_buf, alpha_buf, S);
+            // 2. Sharded state update writes unnormalized output to dn_out_buf.
+            pf_deltanet_state<<<DN_HEADS * N_V_CHUNKS, STATE_BS, 0, stream>>>(
+                dn_s_q, dn_s_k, dn_s_v, beta_buf, alpha_buf,
                 dn_states + dn_idx*dn_stride,
-                conv_bufs + dn_idx*DN_CONV_CH*DN_CONV_K,
                 dn_out_buf, S);
+            // 3. Gated RMSNorm in place on dn_out_buf.
+            pf_deltanet_gated_rmsnorm<<<S * DN_HEADS, 128, 0, stream>>>(
+                dn_out_buf, proj_buf2, dn_norm, S);
 
             // Out projection + residual
             cublas_bf16_gemm(cublas, dn_out_buf, out_w, proj_buf, S, HIDDEN, DN_V_SIZE);
