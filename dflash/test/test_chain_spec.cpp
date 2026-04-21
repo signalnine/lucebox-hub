@@ -592,6 +592,61 @@ static void verify_tree(
     }
 }
 
+// Full-attention KV compaction for DDTree sibling walks.
+//
+// The verify wrote each full-attn layer's K/V at DFS slots
+// [pre_pos..pre_pos+N-1]. For the next round's verify to see the right
+// committed prefix, slots [pre_pos..pre_pos+commit_count-1] must hold the
+// K/V of the accepted path's tokens. For each committed depth d whose
+// accepted DFS index != d, copy slot pre_pos+accepted[d] → slot pre_pos+d.
+//
+// Safety: accepted[] is monotone strictly increasing (DFS order + the walk
+// always descends), so iterating d = 0..commit_count-1 never overwrites a
+// slot we still need to read.
+static bool ddtree_compact_kv(TargetCache & cache,
+                              int pre_pos,
+                              const std::vector<int> & accepted,
+                              int commit_count)
+{
+    cudaStream_t stream = nullptr;
+    const int n_full_attn = (int)cache.attn_k.size();
+    for (int d = 0; d < commit_count; d++) {
+        const int src_dfs = accepted[d];
+        if (src_dfs == d) continue;
+        for (int l = 0; l < n_full_attn; l++) {
+            ggml_tensor * K = cache.attn_k[l];
+            ggml_tensor * V = cache.attn_v[l];
+            const size_t slot_bytes_K = K->nb[1];
+            const size_t slot_bytes_V = V->nb[1];
+            const int n_kv = (int)K->ne[2];
+            for (int h = 0; h < n_kv; h++) {
+                const size_t k_src = (size_t)(pre_pos + src_dfs) * slot_bytes_K + (size_t)h * K->nb[2];
+                const size_t k_dst = (size_t)(pre_pos + d)       * slot_bytes_K + (size_t)h * K->nb[2];
+                const size_t v_src = (size_t)(pre_pos + src_dfs) * slot_bytes_V + (size_t)h * V->nb[2];
+                const size_t v_dst = (size_t)(pre_pos + d)       * slot_bytes_V + (size_t)h * V->nb[2];
+                cudaError_t ce;
+                ce = cudaMemcpyAsync((char *)K->data + k_dst,
+                                     (const char *)K->data + k_src,
+                                     slot_bytes_K, cudaMemcpyDeviceToDevice, stream);
+                if (ce != cudaSuccess) {
+                    std::fprintf(stderr, "kv compact K l=%d h=%d: %s\n",
+                                 l, h, cudaGetErrorString(ce));
+                    return false;
+                }
+                ce = cudaMemcpyAsync((char *)V->data + v_dst,
+                                     (const char *)V->data + v_src,
+                                     slot_bytes_V, cudaMemcpyDeviceToDevice, stream);
+                if (ce != cudaSuccess) {
+                    std::fprintf(stderr, "kv compact V l=%d h=%d: %s\n",
+                                 l, h, cudaGetErrorString(ce));
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 // Fast DDTree rollback: reconstruct target cache state to "after processing
 // accepted path of length commit_count". Ported from test_dflash.cpp.
 //
@@ -983,6 +1038,8 @@ int main(int argc, char ** argv) {
     int n_rounds        = 0;
     long long n_drafted = 0;
     long long n_matched = 0;
+    long long n_ddtree_sibling_walks = 0;
+    long long n_ddtree_sibling_commits = 0;
 
     auto t_start = std::chrono::steady_clock::now();
     while ((int)gen.size() < n_gen) {
@@ -1190,15 +1247,33 @@ int main(int argc, char ** argv) {
             // has accepted[i] == i for every i. A sibling pop lands in a slot
             // beyond L, making accepted[i] != i at that depth.
             bool walked_sibling = false;
+            int sibling_d = -1;
             for (size_t ii = 0; ii < ddtree_accepted.size(); ii++) {
-                if (ddtree_accepted[ii] != (int)ii) { walked_sibling = true; break; }
+                if (ddtree_accepted[ii] != (int)ii) {
+                    walked_sibling = true;
+                    if (sibling_d < 0) sibling_d = (int)ii;
+                }
+            }
+            if (walked_sibling) {
+                n_ddtree_sibling_walks++;
+                // Count committed tokens that came from sibling path (d >= sibling_d).
+                n_ddtree_sibling_commits += std::max(0, commit_count - sibling_d);
             }
 
             bool fast_ok = false;
-            if (!walked_sibling && commit_count > 0) {
-                fast_ok = ddtree_fast_rollback_target(
-                    sg_tgt, c_tgt, ddtree_accepted, ddtree_tree,
-                    commit_count, /*walked_sibling=*/false);
+            if (commit_count > 0) {
+                // On sibling walks, compact full-attn KV slots so that
+                // slot[pre_pos+d] holds accepted[d]'s K/V. SSM + conv rollback
+                // uses the tree parent chain for the window; see
+                // ddtree_fast_rollback_target.
+                bool kv_ok = walked_sibling
+                    ? ddtree_compact_kv(c_tgt, pre_pos, ddtree_accepted, commit_count)
+                    : true;
+                if (kv_ok) {
+                    fast_ok = ddtree_fast_rollback_target(
+                        sg_tgt, c_tgt, ddtree_accepted, ddtree_tree,
+                        commit_count, walked_sibling);
+                }
                 if (fast_ok) c_tgt.cur_pos = pre_pos + commit_count;
             }
             if (!fast_ok) catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
@@ -1251,6 +1326,12 @@ int main(int argc, char ** argv) {
                 gen.size(), secs, tps);
     std::printf("[chain] rounds=%d  drafted=%lld  matched=%lld  avg_commit/round=%.2f (N_spec=%d)\n",
                 n_rounds, n_drafted, n_matched, al, N_spec);
+    if (verify_mode == VERIFY_DDTREE) {
+        std::printf("[ddtree] sibling_walks=%lld (%.1f%% of rounds)  sibling_commits=%lld\n",
+                    n_ddtree_sibling_walks,
+                    n_rounds > 0 ? 100.0 * n_ddtree_sibling_walks / n_rounds : 0.0,
+                    n_ddtree_sibling_commits);
+    }
 
     // Emit full output (prompt + gen)
     std::vector<int32_t> all; all.reserve(prompt.size() + gen.size());
