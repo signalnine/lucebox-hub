@@ -26,23 +26,30 @@ All benchmarks are **batch size 1, single-stream decode**, targeting local infer
 
 ## RTX 5090: pp520 tg128
 
-Fresh build on `rtx-5090` branch (`-arch=sm_120`, `NUM_BLOCKS=170`, `BLOCK_SIZE=1024`), CUDA 13.2 / PyTorch 2.11+cu130. Three-run mean, stock power limit 575 W:
+Build on `rtx-5090` branch (`-arch=sm_120`, `NUM_BLOCKS=170`, `BLOCK_SIZE=1024`, parallel DeltaNet prefill path), CUDA 13.2 / PyTorch 2.11+cu130. Five-run mean, stock power limit 575 W:
 
 | Method | pp520 (tok/s) | tg128 (tok/s) |
 |--------|:---:|:---:|
-| **Megakernel** | 15,050 | **715** |
-| llama.cpp BF16 | **31,258** | 504 |
+| **Megakernel** | **34,650** | **715** |
+| llama.cpp BF16 | 31,258 | 504 |
 | PyTorch HF | 6,865 | 81 |
 
 ### Speedups
 
 | | vs llama.cpp | vs PyTorch |
 |---|:---:|:---:|
+| **Prefill (pp520)** | **1.11×** | **5.05×** |
 | **Decode (tg128)** | **1.42×** | **8.8×** |
 
-### Prefill regression — known issue
+### Prefill path rewrite (axp)
 
-On 5090 the megakernel's pp520 drops from 37,800 (3090) to 15,050 — a 2.5× regression on a card with 2× the SMs and bandwidth. `nsys` isolated the cause to `pf_deltanet_recurrence` in `prefill.cu`, which launches only 16 blocks (one per DeltaNet head) and therefore uses 16/170 = 9 % of SMs on Blackwell (vs 16/82 = 19 % on Ampere). The fix is algorithmic — shard along the V-dimension for 64+ blocks — and is tracked separately. Decode is unaffected because its megakernel uses all 170 SMs cooperatively.
+First-pass pp520 on 5090 was **15,050 tok/s** — a 2.5× regression from the 3090's published 37,800. `nsys` isolated the cause to `pf_deltanet_recurrence`, which launched only 16 blocks (one per DeltaNet head, 9 % SM occupancy on Blackwell vs 19 % on Ampere) and consumed 80 % of prefill time. The fix was algorithmic, landed in the same `rtx-5090` branch:
+
+- Observation: the per-token serial dependency is only in the state update. The conv1d over the time axis has no true cross-token dependency — it's a standard 1D conv with kernel=4 whose history comes from the previous call (read-only within one prefill).
+- Refactor: replace the single serial kernel with five parallel ones — a fully parallel `pf_conv1d_parallel` (grid ~5,700 blocks), a cheap `pf_conv_buf_save`, a per-(t, h) `pf_deltanet_norm_activate` (grid 8,320 blocks), a V-sharded `pf_deltanet_state` (grid 128 blocks for N\_V\_CHUNKS=8), and a per-(t, h) `pf_deltanet_gated_rmsnorm` (grid 8,320 blocks).
+- Result: pp520 recovers to **34,650 tok/s** (+130 %), past llama.cpp's 31,258 on the same card. Decode is unaffected (still 715 tok/s). Correctness holds — `final_bench.py` output matches PyTorch HF token for token.
+
+Remaining gap to the 3090's 37,800: likely in the state kernel itself (128 blocks × ~470 µs per call × 18 layers = 8.5 ms of prefill). Further sharding (N\_V\_CHUNKS=16 → 256 blocks, or a fundamentally different algorithm like chunkwise parallel prefix) could close it. Not pursued — we already beat llama.cpp on the 5090 and the decode story is the product.
 
 ### BLOCK_SIZE sweep on 5090 (3-run means, decode)
 
@@ -67,7 +74,7 @@ At the hardware PL floor the 5090 draws **12 % less power than an M5 Max while d
 
 ## RTX 5090 Power Efficiency (DVFS)
 
-Sweep across the full PL range (400 W is the hardware floor on this card). Power and SM clock sampled in-process via pynvml at 20 Hz. Per-iteration window trims 1.5 s of startup and 1.0 s of teardown.
+Sweep across the full PL range (400 W is the hardware floor on this card). Power and SM clock sampled in-process via pynvml at 20 Hz. Per-iteration window trims 1.5 s of startup and 1.0 s of teardown. Note: pp numbers in this table are from the pre-axp build (15 k on 5090); the tg number and tok/J conclusions are unchanged by the prefill rewrite because decode time dominates `final_bench.py`.
 
 | Power Limit | Actual Draw | SM Clock | pp520 | tg128 | tok/J |
 |:---:|:---:|:---:|:---:|:---:|:---:|
