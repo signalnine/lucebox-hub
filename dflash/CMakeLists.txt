@@ -42,6 +42,7 @@ add_library(dflash27b STATIC
     src/gguf_target_loader.cpp
     src/safetensors_draft.cpp
     src/qwen35_target_graph.cpp
+    src/qwen36_target_graph.cpp
     src/qwen3_dflash_graph.cpp
     src/kv_cache.cpp
     src/f16_convert.cu

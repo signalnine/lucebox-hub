@@ -148,7 +148,9 @@ bool load_target_gguf(const std::string & path,
         return false;
     }
 
-    // Validate arch + the dimensions we hardcode everywhere.
+    // Validate arch. Accept qwen35 (dense 27B) and qwen35moe (35B-A3B MoE).
+    target_arch_t arch_tag;
+    std::string   arch_prefix;   // key prefix, e.g. "qwen35" or "qwen35moe"
     {
         int64_t arch_id = gguf_find_key(gctx, "general.architecture");
         if (arch_id < 0) {
@@ -156,59 +158,98 @@ bool load_target_gguf(const std::string & path,
             gguf_free(gctx);
             return false;
         }
-        const char * arch = gguf_get_val_str(gctx, arch_id);
-        if (std::string(arch) != "qwen35") {
-            set_last_error(std::string("unexpected arch: ") + arch + " (expected qwen35)");
+        const std::string arch = gguf_get_val_str(gctx, arch_id);
+        if (arch == "qwen35") {
+            arch_tag    = TARGET_ARCH_QWEN35;
+            arch_prefix = "qwen35";
+        } else if (arch == "qwen35moe") {
+            arch_tag    = TARGET_ARCH_QWEN35MOE;
+            arch_prefix = "qwen35moe";
+        } else {
+            set_last_error("unexpected arch: " + arch + " (expected qwen35 or qwen35moe)");
             gguf_free(gctx);
             return false;
         }
     }
 
-    std::string err;
-    const uint32_t n_embd = get_u32_or(gctx, "qwen35.embedding_length",    0);
-    const uint32_t n_ff   = get_u32_or(gctx, "qwen35.feed_forward_length", 0);
-    const uint32_t n_layer= get_u32_or(gctx, "qwen35.block_count",         0);
-    const uint32_t n_head = get_u32_or(gctx, "qwen35.attention.head_count",0);
-    const uint32_t n_headkv=get_u32_or(gctx, "qwen35.attention.head_count_kv",0);
-    const uint32_t kl     = get_u32_or(gctx, "qwen35.attention.key_length",   0);
-    const uint32_t vl     = get_u32_or(gctx, "qwen35.attention.value_length", 0);
-    const uint32_t fai    = get_u32_or(gctx, "qwen35.full_attention_interval",0);
-    const uint32_t ssm_conv  = get_u32_or(gctx, "qwen35.ssm.conv_kernel",  0);
-    const uint32_t ssm_inner = get_u32_or(gctx, "qwen35.ssm.inner_size",   0);
-    const uint32_t ssm_state = get_u32_or(gctx, "qwen35.ssm.state_size",   0);
-    const uint32_t ssm_dt    = get_u32_or(gctx, "qwen35.ssm.time_step_rank",0);
-    const uint32_t ssm_grp   = get_u32_or(gctx, "qwen35.ssm.group_count",  0);
+    // Helper for per-arch keys ("qwen35.X" or "qwen35moe.X").
+    auto k = [&](const char * suffix) {
+        return (arch_prefix + "." + suffix);
+    };
 
-    if (n_embd != 5120 || n_layer != 64 || n_head != 24 || n_headkv != 4 ||
-        kl != 256 || vl != 256 || n_ff != 17408 || fai != 4 ||
-        ssm_conv != 4 || ssm_inner != 6144 || ssm_state != 128 ||
-        ssm_dt != 48 || ssm_grp != 16) {
-        char buf[512];
+    std::string err;
+    const uint32_t n_embd = get_u32_or(gctx, k("embedding_length").c_str(),    0);
+    const uint32_t n_ff   = get_u32_or(gctx, k("feed_forward_length").c_str(), 0);  // 0 on MoE
+    const uint32_t n_layer= get_u32_or(gctx, k("block_count").c_str(),         0);
+    const uint32_t n_head = get_u32_or(gctx, k("attention.head_count").c_str(),0);
+    const uint32_t n_headkv=get_u32_or(gctx, k("attention.head_count_kv").c_str(),0);
+    const uint32_t kl     = get_u32_or(gctx, k("attention.key_length").c_str(),   0);
+    const uint32_t vl     = get_u32_or(gctx, k("attention.value_length").c_str(), 0);
+    const uint32_t fai    = get_u32_or(gctx, k("full_attention_interval").c_str(),0);
+    const uint32_t ssm_conv  = get_u32_or(gctx, k("ssm.conv_kernel").c_str(),  0);
+    const uint32_t ssm_inner = get_u32_or(gctx, k("ssm.inner_size").c_str(),   0);
+    const uint32_t ssm_state = get_u32_or(gctx, k("ssm.state_size").c_str(),   0);
+    const uint32_t ssm_dt    = get_u32_or(gctx, k("ssm.time_step_rank").c_str(),0);
+    const uint32_t ssm_grp   = get_u32_or(gctx, k("ssm.group_count").c_str(),  0);
+    // MoE-only (0 on qwen35 dense)
+    const uint32_t n_expert      = get_u32_or(gctx, k("expert_count").c_str(),                      0);
+    const uint32_t n_expert_used = get_u32_or(gctx, k("expert_used_count").c_str(),                 0);
+    const uint32_t n_ff_expert   = get_u32_or(gctx, k("expert_feed_forward_length").c_str(),        0);
+    const uint32_t n_ff_shexp    = get_u32_or(gctx, k("expert_shared_feed_forward_length").c_str(), 0);
+
+    bool hparams_ok = false;
+    if (arch_tag == TARGET_ARCH_QWEN35) {
+        hparams_ok = (n_embd == 5120 && n_layer == 64 && n_head == 24 && n_headkv == 4 &&
+                      kl == 256 && vl == 256 && n_ff == 17408 && fai == 4 &&
+                      ssm_conv == 4 && ssm_inner == 6144 && ssm_state == 128 &&
+                      ssm_dt == 48 && ssm_grp == 16);
+    } else { // qwen35moe
+        hparams_ok = (n_embd == DFLASH36_TARGET_HIDDEN && n_layer == DFLASH36_TARGET_LAYERS &&
+                      n_head == DFLASH36_TARGET_N_HEAD && n_headkv == DFLASH36_TARGET_N_HEAD_KV &&
+                      kl == DFLASH36_TARGET_HEAD_DIM && vl == DFLASH36_TARGET_HEAD_DIM &&
+                      fai == DFLASH36_TARGET_FULL_ATTN_INTERVAL &&
+                      ssm_conv == DFLASH36_TARGET_SSM_CONV_KERN &&
+                      ssm_inner == DFLASH36_TARGET_SSM_D_INNER &&
+                      ssm_state == DFLASH36_TARGET_SSM_D_STATE &&
+                      ssm_dt == DFLASH36_TARGET_SSM_DT_RANK &&
+                      ssm_grp == DFLASH36_TARGET_SSM_N_GROUP &&
+                      n_expert == DFLASH36_TARGET_N_EXPERT &&
+                      n_expert_used == DFLASH36_TARGET_N_EXPERT_USED &&
+                      n_ff_expert == DFLASH36_TARGET_FFN_EXPERT &&
+                      n_ff_shexp == DFLASH36_TARGET_FFN_SHEXP);
+    }
+    if (!hparams_ok) {
+        char buf[640];
         std::snprintf(buf, sizeof(buf),
-            "unexpected hparams: n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
-            "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u}",
-            n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
-            ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp);
+            "unexpected hparams for arch '%s': n_embd=%u n_layer=%u n_head=%u n_head_kv=%u "
+            "kl=%u vl=%u n_ff=%u fai=%u ssm{conv=%u inner=%u state=%u dt=%u grp=%u} "
+            "moe{n=%u used=%u ff=%u shexp=%u}",
+            arch_prefix.c_str(), n_embd, n_layer, n_head, n_headkv, kl, vl, n_ff, fai,
+            ssm_conv, ssm_inner, ssm_state, ssm_dt, ssm_grp,
+            n_expert, n_expert_used, n_ff_expert, n_ff_shexp);
         set_last_error(buf);
         gguf_free(gctx);
         return false;
     }
 
-    // rope dimension_sections (array of 4 uint32)
+    // rope dimension_sections (array of 4 uint32). Qwen3.5-27B uses
+    // [11,11,10,0]; Qwen3.6-35B-A3B stores a single-element [0] array
+    // (no M-RoPE — the arch uses plain RoPE with dimension_count=64).
     int rope_sections[4] = {0, 0, 0, 0};
     {
-        int64_t rid = gguf_find_key(gctx, "qwen35.rope.dimension_sections");
+        int64_t rid = gguf_find_key(gctx, std::string(arch_prefix + ".rope.dimension_sections").c_str());
         if (rid >= 0) {
             size_t n = gguf_get_arr_n(gctx, rid);
             if (n >= 4) {
                 const int32_t * arr = (const int32_t *)gguf_get_arr_data(gctx, rid);
-                for (int k = 0; k < 4; k++) rope_sections[k] = arr[k];
+                for (int kk = 0; kk < 4; kk++) rope_sections[kk] = arr[kk];
             }
         }
     }
 
     out.ctx     = meta_ctx;
     out.backend = backend;
+    out.arch    = arch_tag;
     out.n_layer = (int)n_layer;
     out.n_embd  = (int)n_embd;
     out.n_ff    = (int)n_ff;
@@ -217,12 +258,16 @@ bool load_target_gguf(const std::string & path,
     out.n_embd_head_k = (int)kl;
     out.n_embd_head_v = (int)vl;
     out.full_attention_interval = (int)fai;
-    for (int k = 0; k < 4; k++) out.rope_sections[k] = rope_sections[k];
+    for (int kk = 0; kk < 4; kk++) out.rope_sections[kk] = rope_sections[kk];
     out.ssm_d_conv = (int)ssm_conv;
     out.ssm_d_inner= (int)ssm_inner;
     out.ssm_d_state= (int)ssm_state;
     out.ssm_dt_rank= (int)ssm_dt;
     out.ssm_n_group= (int)ssm_grp;
+    out.n_expert       = (int)n_expert;
+    out.n_expert_used  = (int)n_expert_used;
+    out.n_ff_expert    = (int)n_ff_expert;
+    out.n_ff_shexp     = (int)n_ff_shexp;
     out.layers.assign((size_t)n_layer, TargetLayer{});
 
     // ── 2. Wire our layer pointers to tensors inside meta_ctx ─────────
@@ -246,18 +291,53 @@ bool load_target_gguf(const std::string & path,
         };
         TargetLayer & L = out.layers[il];
 
-        // Always-present tensors
+        // Attention/DeltaNet norms (always present)
         L.attn_norm      = fnd("attn_norm.weight");
         L.attn_post_norm = fnd("post_attention_norm.weight");
-        L.w_gate         = fnd("ffn_gate.weight");
-        L.w_up           = fnd("ffn_up.weight");
-        L.w_down         = fnd("ffn_down.weight");
-        if (!L.attn_norm || !L.attn_post_norm || !L.w_gate || !L.w_up || !L.w_down) {
+        if (!L.attn_norm || !L.attn_post_norm) {
             char b[128];
-            std::snprintf(b, sizeof(b), "layer %d: missing shared tensor", il);
+            std::snprintf(b, sizeof(b), "layer %d: missing attn norms", il);
             set_last_error(b);
             gguf_free(gctx);
             return false;
+        }
+
+        // FFN: dense on qwen35, MoE (+ shared expert) on qwen35moe.
+        if (arch_tag == TARGET_ARCH_QWEN35) {
+            L.w_gate = fnd("ffn_gate.weight");
+            L.w_up   = fnd("ffn_up.weight");
+            L.w_down = fnd("ffn_down.weight");
+            if (!L.w_gate || !L.w_up || !L.w_down) {
+                char b[128];
+                std::snprintf(b, sizeof(b), "layer %d: missing dense FFN tensor", il);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
+        } else {  // TARGET_ARCH_QWEN35MOE
+            L.ffn_gate_inp       = fnd("ffn_gate_inp.weight");
+            L.ffn_gate_exps      = fnd("ffn_gate_exps.weight");
+            L.ffn_up_exps        = fnd("ffn_up_exps.weight");
+            L.ffn_down_exps      = fnd("ffn_down_exps.weight");
+            L.ffn_gate_inp_shexp = fnd("ffn_gate_inp_shexp.weight");
+            L.ffn_gate_shexp     = fnd("ffn_gate_shexp.weight");
+            L.ffn_up_shexp       = fnd("ffn_up_shexp.weight");
+            L.ffn_down_shexp     = fnd("ffn_down_shexp.weight");
+            // All are required for MoE layers.
+            if (!L.ffn_gate_inp || !L.ffn_gate_exps || !L.ffn_up_exps ||
+                !L.ffn_down_exps || !L.ffn_gate_inp_shexp ||
+                !L.ffn_gate_shexp || !L.ffn_up_shexp || !L.ffn_down_shexp) {
+                char b[160];
+                std::snprintf(b, sizeof(b), "layer %d: missing MoE tensor "
+                    "(gate_inp=%p exps={%p,%p,%p} shexp={%p,%p,%p,%p})",
+                    il, (void*)L.ffn_gate_inp, (void*)L.ffn_gate_exps,
+                    (void*)L.ffn_up_exps, (void*)L.ffn_down_exps,
+                    (void*)L.ffn_gate_inp_shexp, (void*)L.ffn_gate_shexp,
+                    (void*)L.ffn_up_shexp, (void*)L.ffn_down_shexp);
+                set_last_error(b);
+                gguf_free(gctx);
+                return false;
+            }
         }
 
         // Full-attention tensors (only on layers where (il+1)%fai == 0,

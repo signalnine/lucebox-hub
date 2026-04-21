@@ -78,7 +78,7 @@ static bool build_step_graph(
     gi.kv_start       = kv_start;
     gi.capture_layers = false;
 
-    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    QwenGraphOutputs go = build_target_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     ggml_set_output(go.logits);
     ggml_build_forward_expand(sg.gf, go.logits);

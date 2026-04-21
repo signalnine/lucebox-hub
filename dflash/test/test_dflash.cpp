@@ -550,7 +550,7 @@ static bool build_target_step(
     gi.capture_layers             = capture;
     gi.capture_delta_intermediate = capture_delta_intermediate;
 
-    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    QwenGraphOutputs go = build_target_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
@@ -621,7 +621,7 @@ static bool build_target_step_tree(
     gi.capture_delta_intermediate = true;
     gi.parent_ids                 = sg.parent_ids;
 
-    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
+    QwenGraphOutputs go = build_target_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
     sg.delta_captures = std::move(go.delta_captures);

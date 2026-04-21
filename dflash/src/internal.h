@@ -13,12 +13,22 @@
 #include "gguf.h"
 
 #include "dflash27b.h"
+#include "dflash36.h"
 
 namespace dflash27b {
 
 // Single source of truth for error reporting.
 // All loaders / graph builders push into this via set_last_error(...).
 void set_last_error(std::string msg);
+
+// Which target architecture is loaded. Detected from the GGUF's
+// `general.architecture` field at load time. Graph builders dispatch on
+// this. qwen35 = original 27B (hybrid dense). qwen35moe = Qwen3.6-35B-A3B
+// (hybrid MoE + shared expert + MXFP4 expert weights).
+enum target_arch_t {
+    TARGET_ARCH_QWEN35    = 0,
+    TARGET_ARCH_QWEN35MOE = 1,
+};
 
 // ─── Target weights (Qwen3.5-27B, qwen35 hybrid, Q4_K_M in ggml context) ──
 //
@@ -61,6 +71,19 @@ struct TargetLayer {
     ggml_tensor * ssm_dt_bias    = nullptr;  // [dt_rank] per-head alpha bias
     ggml_tensor * ssm_norm       = nullptr;  // [head_v_dim]
     ggml_tensor * ssm_out        = nullptr;  // output projection after delta-net
+
+    // MoE FFN fields (non-null for qwen35moe arch; w_gate/w_up/w_down above
+    // are null on MoE arch and vice versa).
+    ggml_tensor * ffn_gate_inp        = nullptr;  // [hidden, n_expert]   router logits
+    ggml_tensor * ffn_gate_exps       = nullptr;  // [hidden, ffn_expert, n_expert]  MXFP4
+    ggml_tensor * ffn_up_exps         = nullptr;  // [hidden, ffn_expert, n_expert]  MXFP4
+    ggml_tensor * ffn_down_exps       = nullptr;  // [ffn_expert, hidden, n_expert]  Q5_K / Q6_K
+
+    // Shared expert (always active on MoE arch; null on dense arch).
+    ggml_tensor * ffn_gate_inp_shexp  = nullptr;  // [hidden]  — one scalar per token
+    ggml_tensor * ffn_gate_shexp      = nullptr;  // [hidden, ffn_shexp]
+    ggml_tensor * ffn_up_shexp        = nullptr;  // [hidden, ffn_shexp]
+    ggml_tensor * ffn_down_shexp      = nullptr;  // [ffn_shexp, hidden]
 };
 
 // CPU-side embedder: keeps a mmap of the GGUF alive and knows how to
@@ -97,7 +120,9 @@ struct TargetWeights {
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
 
-    // Metadata from GGUF (validated at load time)
+    // Metadata from GGUF (validated at load time). Defaults reflect qwen35
+    // (27B); load_target_gguf() overwrites all fields when it reads the file.
+    target_arch_t arch          = TARGET_ARCH_QWEN35;
     int full_attention_interval = 4;
     int rope_sections[4]        = {11, 11, 10, 0};
     int n_embd_head_k           = 256;  // key_length
@@ -106,12 +131,18 @@ struct TargetWeights {
     int n_head_kv               = 4;
     int n_layer                 = 64;
     int n_embd                  = 5120;
-    int n_ff                    = 17408;
+    int n_ff                    = 17408;  // dense FFN; ignored on MoE arch
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;
     int ssm_dt_rank             = 48;
     int ssm_n_group             = 16;
+
+    // MoE-specific (only populated for TARGET_ARCH_QWEN35MOE; 0 otherwise)
+    int n_expert                = 0;
+    int n_expert_used           = 0;
+    int n_ff_expert             = 0;   // per-expert hidden
+    int n_ff_shexp              = 0;   // shared-expert hidden
 };
 
 // Load a Q4_K_M target model from a GGUF file on disk.
@@ -284,5 +315,28 @@ QwenGraphOutputs build_qwen35_graph(
     const TargetWeights &  w,
     TargetCache &          cache,
     const QwenGraphInputs & in);
+
+// Qwen3.6-35B-A3B (qwen35moe arch). Same hybrid DeltaNet + Attention layer
+// dispatch as qwen35, but with MoE (256 experts top-8) + shared-expert FFN
+// in place of dense SwiGLU, and smaller hparams (see dflash36.h).
+QwenGraphOutputs build_qwen36_graph(
+    ggml_context *         ctx,
+    ggml_cgraph *          gf,
+    const TargetWeights &  w,
+    TargetCache &          cache,
+    const QwenGraphInputs & in);
+
+// Arch-dispatching graph builder. All test binaries should call THIS, not
+// the per-arch one. Looks at w.arch and routes.
+inline QwenGraphOutputs build_target_graph(
+    ggml_context *          ctx,
+    ggml_cgraph *           gf,
+    const TargetWeights &   w,
+    TargetCache &           cache,
+    const QwenGraphInputs & in)
+{
+    if (w.arch == TARGET_ARCH_QWEN35MOE) return build_qwen36_graph(ctx, gf, w, cache, in);
+    return build_qwen35_graph(ctx, gf, w, cache, in);
+}
 
 } // namespace dflash27b
