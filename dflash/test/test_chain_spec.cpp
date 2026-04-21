@@ -24,11 +24,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <queue>
+#include <unordered_map>
 #include <vector>
 
 using namespace dflash27b;
@@ -92,6 +95,188 @@ static void build_causal_mask_f16(
         const int max_k = kv_start + q;
         for (int k = 0; k <= max_k && k < kv_len; k++) {
             out[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+    }
+}
+
+// ─── DDTree support (ported from test_dflash.cpp / liranringel/ddtree) ────
+
+// Per-position top-K softmax extraction. Computes log-probabilities via a
+// single pass over the vocab that also maintains top-K in a min-heap and
+// computes logsumexp online.
+static void extract_draft_topk(const float * logits,
+                               int n_positions, int vocab, int K,
+                               float * out_log_probs,
+                               int32_t * out_token_ids,
+                               float temperature = 1.0f) {
+    struct Entry { float logit; int32_t id; };
+    auto cmp_greater = [](const Entry & a, const Entry & b) { return a.logit > b.logit; };
+    const float inv_t = 1.0f / std::max(1e-3f, temperature);
+
+    for (int i = 0; i < n_positions; i++) {
+        const float * li = logits + (size_t)i * vocab;
+        std::vector<Entry> heap;
+        heap.reserve(K);
+        float running_max     = -INFINITY;
+        float running_sum_exp = 0.0f;
+        for (int j = 0; j < vocab; j++) {
+            const float l = li[j] * inv_t;
+            if (l > running_max) {
+                if (running_max > -INFINITY) {
+                    running_sum_exp = running_sum_exp * std::exp(running_max - l);
+                }
+                running_sum_exp += 1.0f;
+                running_max = l;
+            } else {
+                running_sum_exp += std::exp(l - running_max);
+            }
+            if ((int)heap.size() < K) {
+                heap.push_back({l, (int32_t)j});
+                std::push_heap(heap.begin(), heap.end(), cmp_greater);
+            } else if (l > heap.front().logit) {
+                std::pop_heap(heap.begin(), heap.end(), cmp_greater);
+                heap.back() = {l, (int32_t)j};
+                std::push_heap(heap.begin(), heap.end(), cmp_greater);
+            }
+        }
+        const float log_z = running_max + std::log(running_sum_exp);
+        std::sort_heap(heap.begin(), heap.end(), cmp_greater);
+        for (int k = 0; k < K; k++) {
+            out_log_probs[(size_t)i * K + k] = heap[k].logit - log_z;
+            out_token_ids[(size_t)i * K + k] = heap[k].id;
+        }
+    }
+}
+
+// Flat DFS-ordered tree.
+struct DDTree {
+    int                   n_nodes = 0;
+    std::vector<int32_t>  token_ids;        // size n_nodes
+    std::vector<int>      depths;           // size n_nodes (1..L)
+    std::vector<int>      parents;          // size n_nodes + 1; parents[0]=-1
+    std::vector<std::unordered_map<int32_t, int>> child_maps;  // size n_nodes + 1
+    std::vector<uint8_t>  visibility;       // (1 + n_nodes)^2 row-major
+};
+
+// Best-first build of a DDTree from per-position top-K log-probs.
+static DDTree build_ddtree(const float * top_log_probs,
+                           const int32_t * top_token_ids,
+                           int L, int K, int budget,
+                           bool chain_seed = true) {
+    DDTree tree;
+    tree.parents.push_back(-1);
+    tree.child_maps.emplace_back();
+    if (budget <= 0 || L <= 0) {
+        tree.visibility.assign(1, 1);
+        return tree;
+    }
+
+    struct HeapEntry { float neg_logw; int parent_index; int depth; int rank; float logw; };
+    struct HeapCmp   { bool operator()(const HeapEntry & a, const HeapEntry & b) const { return a.neg_logw > b.neg_logw; } };
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, HeapCmp> heap;
+
+    if (chain_seed) {
+        const int chain_depth = std::min(L, budget);
+        float cum_logw = 0.0f;
+        int   prev_idx = 0;
+        for (int d = 1; d <= chain_depth; d++) {
+            const int32_t tok_id = top_token_ids[(size_t)(d - 1) * K + 0];
+            cum_logw += top_log_probs[(size_t)(d - 1) * K + 0];
+            const int cur_idx = tree.n_nodes + 1;
+            tree.token_ids.push_back(tok_id);
+            tree.depths.push_back(d);
+            tree.parents.push_back(prev_idx);
+            tree.child_maps.emplace_back();
+            tree.child_maps[prev_idx][tok_id] = cur_idx;
+            tree.n_nodes++;
+            if (K > 1) {
+                const float sibling_logw = cum_logw
+                    - top_log_probs[(size_t)(d - 1) * K + 0]
+                    + top_log_probs[(size_t)(d - 1) * K + 1];
+                heap.push({ -sibling_logw, prev_idx, d, 1, sibling_logw });
+            }
+            prev_idx = cur_idx;
+        }
+    } else {
+        const float root_logw = top_log_probs[0];
+        heap.push({ -root_logw, 0, 1, 0, root_logw });
+    }
+
+    while (!heap.empty() && tree.n_nodes < budget) {
+        HeapEntry top = heap.top(); heap.pop();
+        const int depth_minus_1 = top.depth - 1;
+        const int32_t token_id  = top_token_ids[(size_t)depth_minus_1 * K + top.rank];
+        const int current_index = tree.n_nodes + 1;
+        tree.token_ids.push_back(token_id);
+        tree.depths.push_back(top.depth);
+        tree.parents.push_back(top.parent_index);
+        tree.child_maps.emplace_back();
+        tree.child_maps[top.parent_index][token_id] = current_index;
+        tree.n_nodes++;
+
+        if (top.rank + 1 < K) {
+            const float sibling_logw = top.logw
+                - top_log_probs[(size_t)depth_minus_1 * K + top.rank]
+                + top_log_probs[(size_t)depth_minus_1 * K + top.rank + 1];
+            heap.push({ -sibling_logw, top.parent_index, top.depth, top.rank + 1, sibling_logw });
+        }
+        if (top.depth < L) {
+            const float child_logw = top.logw
+                + top_log_probs[(size_t)top.depth * K + 0];
+            heap.push({ -child_logw, current_index, top.depth + 1, 0, child_logw });
+        }
+    }
+
+    const int N = 1 + tree.n_nodes;
+    tree.visibility.assign((size_t)N * N, 0);
+    tree.visibility[0 * N + 0] = 1;
+    for (int i = 1; i < N; i++) {
+        const int p = tree.parents[i];
+        for (int j = 0; j < i; j++) {
+            tree.visibility[(size_t)i * N + j] = tree.visibility[(size_t)p * N + j];
+        }
+        tree.visibility[(size_t)i * N + i] = 1;
+    }
+    return tree;
+}
+
+// Walk verified tree following target's argmax at each node.
+static std::vector<int> follow_verified_tree(const DDTree & tree,
+                                             const int32_t * posterior,
+                                             int & out_next_token) {
+    std::vector<int> accepted;
+    accepted.reserve(tree.n_nodes + 1);
+    accepted.push_back(0);
+    int current_index = 0;
+    int next_token    = posterior[0];
+    while (true) {
+        const auto & children = tree.child_maps[current_index];
+        auto it = children.find(next_token);
+        if (it == children.end()) break;
+        current_index = it->second;
+        accepted.push_back(current_index);
+        next_token = posterior[current_index];
+    }
+    out_next_token = next_token;
+    return accepted;
+}
+
+// Build f16 ancestor-only attention mask.
+static void build_tree_mask(const DDTree & tree, int past_length,
+                            std::vector<uint16_t> & out_mask) {
+    const int N      = 1 + tree.n_nodes;
+    const int kv_len = past_length + N;
+    const int kv_pad = align_up(kv_len, KQ_STRIDE_PAD);
+    const int q_pad  = align_up(N,      KQ_MASK_PAD);
+    out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
+    for (int q = 0; q < N; q++) {
+        for (int k = 0; k < past_length; k++) {
+            out_mask[(size_t)q * kv_pad + k] = F16_ZERO;
+        }
+        for (int j = 0; j < N; j++) {
+            if (tree.visibility[(size_t)q * N + j]) {
+                out_mask[(size_t)q * kv_pad + (past_length + j)] = F16_ZERO;
+            }
         }
     }
 }
@@ -424,16 +609,35 @@ int main(int argc, char ** argv) {
     //                             as real DDTree but no branching. Tests
     //                             whether the tree kernel has different
     //                             numerics than the plain batched kernel.
+    //   CHAIN_VERIFY=ddtree       Full DDTree: per-step top-K extraction,
+    //                             best-first branching tree build (budget =
+    //                             DDTREE_BUDGET env, default N_spec+8),
+    //                             ancestor-only mask, walk accepted path.
     // Default = seq (lossless).
-    enum VerifyMode { VERIFY_SEQ, VERIFY_BATCH, VERIFY_TREE_CHAIN };
+    enum VerifyMode { VERIFY_SEQ, VERIFY_BATCH, VERIFY_TREE_CHAIN, VERIFY_DDTREE };
     VerifyMode verify_mode = VERIFY_SEQ;
     if (const char * s = std::getenv("CHAIN_VERIFY")) {
         std::string m = s;
         if      (m == "batch")      verify_mode = VERIFY_BATCH;
         else if (m == "tree_chain") verify_mode = VERIFY_TREE_CHAIN;
+        else if (m == "ddtree")     verify_mode = VERIFY_DDTREE;
     }
     const bool use_batched_verify =
-        (verify_mode == VERIFY_BATCH || verify_mode == VERIFY_TREE_CHAIN);
+        (verify_mode == VERIFY_BATCH || verify_mode == VERIFY_TREE_CHAIN ||
+         verify_mode == VERIFY_DDTREE);
+
+    int ddtree_budget = N_spec + 8;
+    int ddtree_K      = 8;
+    float ddtree_temp = 1.0f;
+    if (const char * s = std::getenv("DDTREE_BUDGET")) ddtree_budget = std::atoi(s);
+    if (const char * s = std::getenv("DDTREE_K"))      ddtree_K      = std::atoi(s);
+    if (const char * s = std::getenv("DDTREE_TEMP"))   ddtree_temp   = std::atof(s);
+    if (ddtree_budget < 1) ddtree_budget = 1;
+    if (ddtree_K      < 1) ddtree_K      = 1;
+    if (verify_mode == VERIFY_DDTREE) {
+        std::printf("[ddtree] budget=%d  K=%d  temp=%.2f  L=%d\n",
+                    ddtree_budget, ddtree_K, ddtree_temp, N_spec);
+    }
 
     ggml_backend_t backend = ggml_backend_cuda_init(0);
     if (!backend) { std::fprintf(stderr, "cuda init failed\n"); return 1; }
@@ -454,10 +658,14 @@ int main(int argc, char ** argv) {
     const int max_ctx = 4096;
     TargetCache c_tgt, c_drf;
     // Size the target's verify-capture tensors (ssm_intermediate, conv_input_cache)
-    // to match N_spec exactly. The conv_input capture cpy asserts that the in-graph
-    // conv_input (shape [(kern-1)+N_spec, ch, 1]) has the same number of elements as
-    // the cache tensor — so this must be N_spec, not a larger default.
-    if (!create_target_cache(w_tgt, max_ctx, N_spec, backend, c_tgt)) {
+    // for the max n_tokens a single verify call will feed. For chain modes that's
+    // N_spec; for DDTree it's 1 + ddtree_budget (root + tree nodes). The conv_input
+    // capture cpy asserts ggml_nelements(a) == ggml_nelements(b), so the cache tensor
+    // size must match exactly what the graph builds.
+    const int verify_max_tokens = (verify_mode == VERIFY_DDTREE)
+        ? std::max(N_spec, 1 + ddtree_budget)
+        : N_spec;
+    if (!create_target_cache(w_tgt, max_ctx, verify_max_tokens, backend, c_tgt)) {
         std::fprintf(stderr, "tgt cache: %s\n", dflash27b_last_error()); return 1;
     }
     if (!create_target_cache(w_drf, max_ctx, 0, backend, c_drf)) {
@@ -660,17 +868,36 @@ int main(int argc, char ** argv) {
         snapshot_ssm_state(c_tgt);
 
         // 1. Draft: N sequential forwards starting from last_tok.
+        //    In DDTree mode we also capture per-position top-K log-probs from
+        //    the draft's full logits vector for tree-building.
+        const int L_ddtree = N_spec;
+        std::vector<float>   ddtree_logp;
+        std::vector<int32_t> ddtree_toks;
+        if (verify_mode == VERIFY_DDTREE) {
+            ddtree_logp.assign((size_t)L_ddtree * ddtree_K, 0.0f);
+            ddtree_toks.assign((size_t)L_ddtree * ddtree_K, 0);
+        }
         int32_t carry = last_tok;
         for (int i = 0; i < N_spec; i++) {
             drafts[i] = step_drf(carry, pre_pos + i);
             c_drf.cur_pos = pre_pos + i + 1;
+            if (verify_mode == VERIFY_DDTREE) {
+                extract_draft_topk(logits_drf.data(), 1, (int)w_drf.embedder.n_vocab,
+                                   ddtree_K,
+                                   ddtree_logp.data() + (size_t)i * ddtree_K,
+                                   ddtree_toks.data() + (size_t)i * ddtree_K,
+                                   ddtree_temp);
+            }
             carry = drafts[i];
         }
         n_drafted += N_spec;
 
-        // 2. Target verify — one of three modes.
-        int k = 0;
-        int32_t t_pred = -1;
+        // 2. Target verify — one of four modes.
+        int k = 0;                     // number of accepted draft matches (chain)
+        int commit_count = 0;          // total tokens committed this round
+        int32_t t_pred = -1;           // target's correction at first mismatch (chain)
+        int32_t next_last_tok = -1;    // last_tok carry for next round
+        std::vector<int32_t> accepted_tokens;  // tokens in order, length commit_count
         if (verify_mode == VERIFY_BATCH) {
             verify_in[0] = last_tok;
             for (int i = 1; i < N_spec; i++) verify_in[i] = drafts[i - 1];
@@ -683,6 +910,10 @@ int main(int argc, char ** argv) {
                 else break;
             }
             t_pred = verify_out[k < N_spec ? k : N_spec - 1];
+            commit_count = std::min(k + 1, N_spec);
+            accepted_tokens.assign(1, last_tok);
+            for (int i = 0; i + 1 < commit_count; i++) accepted_tokens.push_back(drafts[i]);
+            next_last_tok = (k < N_spec) ? t_pred : drafts[N_spec - 1];
         } else if (verify_mode == VERIFY_TREE_CHAIN) {
             // Linear chain via tree-mode kernel. parent_ids[0]=-1 (root
             // parent sentinel), parent_ids[i]=i-1 (sequential for i>0).
@@ -712,55 +943,115 @@ int main(int argc, char ** argv) {
                 else break;
             }
             t_pred = verify_out[k < N_spec ? k : N_spec - 1];
+            commit_count = std::min(k + 1, N_spec);
+            accepted_tokens.assign(1, last_tok);
+            for (int i = 0; i + 1 < commit_count; i++) accepted_tokens.push_back(drafts[i]);
+            next_last_tok = (k < N_spec) ? t_pred : drafts[N_spec - 1];
+        } else if (verify_mode == VERIFY_DDTREE) {
+            // Build best-first branching tree from draft's per-position top-K.
+            DDTree tree = build_ddtree(ddtree_logp.data(), ddtree_toks.data(),
+                                       L_ddtree, ddtree_K, ddtree_budget, /*chain_seed=*/true);
+            const int N = 1 + tree.n_nodes;  // root + tree nodes
+            // Flat tokens: slot 0 = root (= last_tok), slots 1..N-1 = tree nodes.
+            std::vector<int32_t> flat_tokens(N);
+            flat_tokens[0] = last_tok;
+            for (int i = 0; i < tree.n_nodes; i++) flat_tokens[1 + i] = tree.token_ids[i];
+            // Positions (axis-major): committed + depth.
+            std::vector<int32_t> pos4(4 * N);
+            for (int i = 0; i < N; i++) {
+                const int p = pre_pos + (i == 0 ? 0 : tree.depths[i - 1]);
+                pos4[0 * N + i] = p;
+                pos4[1 * N + i] = p;
+                pos4[2 * N + i] = p;
+                pos4[3 * N + i] = 0;
+            }
+            // Ancestor-only mask.
+            build_tree_mask(tree, pre_pos, mask_buf);
+            // parent_ids (slot 0 = -1 root sentinel).
+            std::vector<int32_t> parent_ids_tree(N);
+            parent_ids_tree[0] = -1;
+            for (int i = 1; i < N; i++) parent_ids_tree[i] = (int32_t)tree.parents[i];
+            // Verify.
+            std::vector<int32_t> posterior((size_t)N);
+            verify_tree(w_tgt, c_tgt, backend, sg_tgt,
+                        flat_tokens.data(), parent_ids_tree.data(),
+                        pos4.data(), mask_buf.data(),
+                        N, pre_pos,
+                        embed_tgt, logits_tgt, posterior.data());
+            c_tgt.cur_pos = pre_pos + N;
+            // Walk tree following target's argmax at each slot.
+            int next_tok_w = -1;
+            std::vector<int> accepted = follow_verified_tree(tree, posterior.data(), next_tok_w);
+            const int accept_depth = (int)accepted.size();  // includes root
+            k = accept_depth - 1;  // matched children (for stats)
+            commit_count = accept_depth;
+            accepted_tokens.resize(commit_count);
+            for (int i = 0; i < commit_count; i++) {
+                const int dfs_idx = accepted[i];
+                accepted_tokens[i] = (dfs_idx == 0) ? last_tok : tree.token_ids[dfs_idx - 1];
+            }
+            next_last_tok = next_tok_w;
         } else {
             // Sequential verify: short-circuit on first mismatch; target
             // cache naturally stops at pre_pos + commit_count.
-            int32_t carry = last_tok;
+            int32_t carry2 = last_tok;
             for (int i = 0; i < N_spec; i++) {
-                t_pred = step_tgt(carry, pre_pos + i);
+                t_pred = step_tgt(carry2, pre_pos + i);
                 c_tgt.cur_pos = pre_pos + i + 1;
-                if (t_pred == drafts[i]) { k++; carry = drafts[i]; }
+                if (t_pred == drafts[i]) { k++; carry2 = drafts[i]; }
                 else                    { break; }
             }
+            commit_count = std::min(k + 1, N_spec);
+            accepted_tokens.assign(1, last_tok);
+            for (int i = 0; i + 1 < commit_count; i++) accepted_tokens.push_back(drafts[i]);
+            next_last_tok = (k < N_spec) ? t_pred : drafts[N_spec - 1];
         }
         n_matched += k;
 
-        const int commit_count = std::min(k + 1, N_spec);
-
-        // Emit committed tokens: last_tok (always) + drafts[0..commit_count-2].
-        gen.push_back(last_tok);
-        for (int i = 0; i + 1 < commit_count; i++) gen.push_back(drafts[i]);
-
-        int32_t next_last_tok = (k < N_spec) ? t_pred : drafts[N_spec - 1];
+        // Emit committed tokens.
+        for (int i = 0; i < commit_count; i++) gen.push_back(accepted_tokens[i]);
 
         // 4. Rollback.
-        //    Target side — batched path consumed all N_spec tokens into cache,
-        //    so if k < N_spec we need target catch-up; if k == N_spec, target
-        //    cache is already at pre_pos + N_spec, nothing to do.
-        //    Sequential path short-circuited at the first mismatch; target
-        //    cache is naturally at pre_pos + commit_count.
-        //    Draft side — always consumed all N_spec; needs catch-up when
-        //    commit_count < N_spec.
+        //    Target side — batched path consumed all N_spec (or tree N) tokens
+        //    into cache. Needs catch-up whenever the committed prefix diverges
+        //    from the chain that batched/tree verify walked. In chain modes
+        //    when commit_count == N_spec this is a no-op; in DDTree we always
+        //    rebuild the cache to the accepted path (siblings in tree ≠ spine).
+        //    Draft side — always consumed all N_spec; needs catch-up when the
+        //    accepted path diverges from the draft top-1 chain, i.e. when any
+        //    accepted_tokens[i] != drafts[i-1] for i in [1, commit_count).
         auto catch_up = [&](const TargetWeights & w, TargetCache & cache, StepGraph & sg,
-                            std::vector<float> & eb, std::vector<float> & lb,
-                            int32_t first_tok) {
+                            std::vector<float> & eb, std::vector<float> & lb) {
             restore_ssm_state(cache);
             cache.cur_pos = pre_pos;
-            int32_t cur = first_tok;
             for (int i = 0; i < commit_count; i++) {
-                (void)step_model(w, cache, backend, sg, cur, pre_pos + i, eb, lb);
+                (void)step_model(w, cache, backend, sg, accepted_tokens[i], pre_pos + i, eb, lb);
                 cache.cur_pos = pre_pos + i + 1;
-                cur = (i + 1 < commit_count) ? drafts[i] : -1;
             }
         };
-        if (commit_count < N_spec) {
-            catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf, last_tok);
-            if (use_batched_verify) {
-                catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt, last_tok);
-            }
+        // Chain modes: draft cache is at pre_pos + N_spec; target cache is at
+        // pre_pos + N_spec (batched) or pre_pos + commit_count (seq). Catch up
+        // iff commit_count differs from where the cache sits, OR if the
+        // accepted prefix diverges from the linear draft chain.
+        // DDTree mode: target cache is at pre_pos + N (tree size, generally
+        // != commit_count), and draft cache is at pre_pos + N_spec. Always
+        // catch up both to pre_pos + commit_count.
+        bool accepted_matches_chain = true;
+        for (int i = 1; i < commit_count; i++) {
+            if (accepted_tokens[i] != drafts[i - 1]) { accepted_matches_chain = false; break; }
         }
-        // When commit_count == N_spec (all match), both caches sit at the
-        // correct next-round pre_pos. Nothing to do.
+        bool draft_needs_catchup, tgt_needs_catchup;
+        if (verify_mode == VERIFY_DDTREE) {
+            draft_needs_catchup = true;
+            tgt_needs_catchup   = true;
+        } else {
+            draft_needs_catchup = (commit_count < N_spec) || !accepted_matches_chain;
+            tgt_needs_catchup   = use_batched_verify &&
+                                  (commit_count < N_spec || !accepted_matches_chain);
+        }
+
+        if (draft_needs_catchup) catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
+        if (tgt_needs_catchup)   catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
 
         last_tok = next_last_tok;
         n_rounds++;
