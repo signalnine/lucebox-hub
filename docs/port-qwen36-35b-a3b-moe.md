@@ -20,7 +20,39 @@ hybrid + Q4_K_M and extends each layer with what the MoE/MXFP4 variant needs.
 | **M1a** — dual-arch scaffolding | ✅ | `TargetWeights.arch` tag, MoE fields on `TargetLayer`, shared loader for `qwen35` and `qwen35moe`, `build_target_graph()` dispatch. |
 | **M1b** — 35B-A3B graph builder | ✅ | `qwen36_target_graph.cpp` with the full stack: Q-packed full-attn (IMROPE) + fused-op DeltaNet + MoE FFN (`ggml_mul_mat_id` on MXFP4 gate/up + normalized-weight sum) + shared expert (sigmoid-scalar gate). End-to-end coherent output on "The capital of France is" → "Paris, a city renowned for its iconic landmarks such as". **125.8 tok/s decode**, ~60 % of llama.cpp's 210.7 baseline. |
 | **M2a** — runtime-dim qwen35 builder | ✅ | `build_full_attn_block` / `build_delta_net_block` / `create_target_cache` now read `w.n_*` / `w.ssm_*` at runtime, not q35:: constants. Loader accepts any qwen35 size and tied LM head. Rope type standardised to `GGML_ROPE_TYPE_IMROPE` for both arches. Qwen3.5-0.8B-BF16 now loads + runs through the same engine as 27B and 35B. |
-| **M2b** — chain-spec orchestrator | ✅ (sequential verify) + 🐛 (batched verify bug) | New binary `test_chain_spec` loads both models via `load_target_gguf`, runs chain-spec with `snapshot_ssm_state` + catch-up rollback. Greedy output matches 35B AR byte-for-byte. Sequential verify throughput 45-63 tok/s depending on N_spec — slower than AR (125) because single-token verify + draft catch-up together cost more than they save at our draft/target speed ratio (0.8B = 300, 35B = 125, i.e. draft ~2.4× faster). A batched N-token target verify was drafted (`verify_batch` + `build_causal_mask_f16` in `test/test_chain_spec.cpp`) but produces draft-aligned logits instead of target's when called with target weights — root cause TBD, likely a position-layout or KV-slot interaction that manifests only at n_tokens > 1. Single-step target at the same `(last_tok, pos)` gives the correct argmax. |
+| **M2b** — chain-spec orchestrator | ✅ (sequential verify) + 🐛 (batched verify bug, isolated) | New binary `test_chain_spec` loads both models via `load_target_gguf`, runs chain-spec with `snapshot_ssm_state` + catch-up rollback. Greedy output matches 35B AR byte-for-byte. Sequential verify throughput 45-63 tok/s depending on N_spec — slower than AR (125) because single-token verify + draft catch-up together cost more than they save at our draft/target speed ratio (0.8B = 300, 35B = 125, i.e. draft ~2.4× faster). The batched verify bug is now isolated to a specific n_tokens pattern (see below); it's NOT arch-specific and blocks M2b's actual speedup. |
+
+### M2b batched-verify bug — diagnostic state
+
+Isolated with a minimal reproducer (`CHAIN_DIAG=1 test_chain_spec ...`): sequential target decode of 8 tokens from "The capital of France is" gives `[11, 264, 3177, 34756, 364, 1141, 25438, 57902]` (= ", a city renowned for its iconic landmarks"). Feeding the SAME input sequence through one batched forward, we expect to recover those 8 argmax predictions exactly — both paths evaluate target greedy on the same (state, inputs). Instead:
+
+```
+seq         : 11   264  3177 34756  364  1141 25438 57902
+batched N=1 : 11                                            (OK — VEC kernel)
+batched N=2 : 11   264                                      (OK)
+batched N=3 : 11   264  3177                                (OK)
+batched N=4 : 13!  264  3177 34756                          (pos 0 WRONG, 1..3 correct)
+batched N=5 : 13!  264  3177 34756  364                     (pos 0 WRONG)
+batched N=6 : 13!  264  3177 34756  364  1141               (pos 0 WRONG)
+batched N=7 : 13!  264  3177 34756  364  1141 25438         (pos 0 WRONG)
+batched N=8 : 13!  264  3177 34756  364  1141 25438 57902   (pos 0 WRONG)
+```
+
+Observations that constrain the fix:
+
+1. **Only position 0 is affected.** Positions 1..N-1 match sequential exactly at every N. So K/V writes, RoPE, SSM evolution, MoE FFN for positions 1..N-1 are all producing the RIGHT per-position logits.
+2. **Threshold is N=4.** N=1,2,3 are correct; N>=4 is wrong at position 0.
+3. **Deterministic.** Running batched twice back-to-back gives the same wrong pos-0 output — not a race.
+4. **Not KV alignment (simple fix).** Tried padding kv_len to FATTN_KQ_STRIDE=256 (and matching mask width): that *didn't* fix N>=4 pos 0 AND broke N=2. (The padding-unaware mask now reaches slots with uninitialized K/V, so the kernel's picks a different VEC/MMA path mid-range.)
+5. **Not SSM state or MoE.** The kernel selection logic in `fattn.cu:ggml_cuda_get_best_fattn_kernel` switches paths at n_tokens boundaries (VEC for n<=2 on Ada+ with quantized K/V, MMA_F16 above). Wrong pos-0 starts right at the MMA_F16 threshold.
+6. **Only the FIRST new position.** Query at `pre_pos` reads cache slots [0..pre_pos] where slot `pre_pos` is just-written from input_0 (the same input as single-step's K for that token). Attention output for q=0 differs between batched-MMA and single-token-VEC despite identical mathematical inputs.
+
+Next-session diagnostics (in order of decreasing hypothesis plausibility):
+
+1. **MMA_F16 kernel bug at the "just-written" KV slot.** Add a one-liner to `build_full_attn_block` that forces VEC by pre-padding Qfa to n_tokens=2 and masking the extra slot; if batched then matches sequential, the bug is in the MMA kernel. If it doesn't, look elsewhere.
+2. **cpy-before-read ordering.** Manually add an explicit data dependency between the K/V `ggml_cpy` ops and `ggml_flash_attn_ext` (e.g., make `Kfa` `src[1]` of a no-op after the cpy so the graph scheduler can see the dep). Rebuild, rerun.
+3. **Bisect by head count.** GQA is 16/2 = 8. Try a build with n_head_kv=1 (hack the loader's check) to see if the broadcast from KV to Q heads is involved.
+4. **Diff vs test_dflash's build_target_step flow.** test_dflash's chain verify path works at n_tokens up to 16 on 27B. Look for what differs — maybe the `capture_delta_intermediate=true` path forces a different-and-correct op selection.
 | M3 — DDTree verify on MoE | ☐ | Tree-mode SSM ops already wired through the graph (parent_ids path); driver changes only. |
 | M4 — full bench + throughput tuning | ☐ | Close 125 → 200+ tok/s gap (likely KV type, MoE routing microcode). |
 | M5 — DFlash-trained draft | ☐ | Stretch; 3-5 days H100 time. |

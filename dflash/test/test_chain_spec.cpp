@@ -66,8 +66,10 @@ static void step_graph_free(StepGraph & sg) {
     sg.logits = nullptr; sg.n_tokens = 0;
 }
 
-// Flash-attn mask alignment (KQ_MASK_PAD in test_dflash.cpp). Our pinned
-// fattn kernel uses 32; TBQ path would bump this to 256.
+// Flash-attn mask alignment (test_dflash convention: 32 on both axes).
+// Kv-axis padding is supposed to be tied to fattn_stride in
+// build_full_attn_block, which still uses stride=1; this is part of the
+// unresolved M2b batched-verify bug — see handoff notes in the port plan.
 static constexpr int KQ_MASK_PAD     = 32;
 static constexpr int KQ_STRIDE_PAD   = 32;
 static constexpr uint16_t F16_ZERO    = 0x0000;
@@ -220,11 +222,13 @@ static void verify_batch(
     ggml_backend_tensor_set(sg.positions, positions.data(), 0,
                             sizeof(int32_t) * positions.size());
 
-    // Causal mask
-    const int kv_len = pos + n_tokens;
-    build_causal_mask_f16(mask_buf, kv_len, n_tokens, pos);
-    ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
-                            sizeof(uint16_t) * mask_buf.size());
+    // Causal mask (only created for n_tokens > 1 — single-token needs none).
+    if (sg.attn_mask) {
+        const int kv_len = pos + n_tokens;
+        build_causal_mask_f16(mask_buf, kv_len, n_tokens, pos);
+        ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0,
+                                sizeof(uint16_t) * mask_buf.size());
+    }
 
     if (ggml_backend_graph_compute(backend, sg.gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "batch compute failed at pos=%d n=%d\n", pos, n_tokens); std::exit(1);
@@ -314,6 +318,99 @@ int main(int argc, char ** argv) {
     auto step_drf = [&](int32_t tok, int pos) {
         return step_model(w_drf, c_drf, backend, sg_drf, tok, pos, embed_drf, logits_drf);
     };
+
+    // ── Minimal batched-verify diagnostic. BEFORE running any draft, run
+    //    the target prefill via single-token step_tgt, snapshot SSM, do N
+    //    single-step target predictions, then restore and do ONE batched
+    //    verify. Compare the two sequences — they MUST agree token-for-token
+    //    because they're both the target greedy-decoding the same sequence.
+    if (const char * s = std::getenv("CHAIN_DIAG")) {
+        (void)s;
+        std::printf("[diag] starting batched-verify diagnostic\n");
+        // Prefill target only on the full prompt.
+        int32_t tp = -1;
+        for (int i = 0; i < (int)prompt.size(); i++) {
+            tp = step_tgt(prompt[i], i);
+            c_tgt.cur_pos = i + 1;
+        }
+        const int P = (int)prompt.size();
+        const int N = 8;
+        int32_t seq_preds[8];
+        int32_t batch_preds[8];
+
+        // Snapshot target state after prefill.
+        snapshot_ssm_state(c_tgt);
+
+        // Sequential: feed tp, then each prediction as input to the next step.
+        int32_t cur = tp;
+        for (int i = 0; i < N; i++) {
+            seq_preds[i] = step_tgt(cur, P + i);
+            c_tgt.cur_pos = P + i + 1;
+            cur = seq_preds[i];
+        }
+        std::printf("[diag] seq  : ");
+        for (int i = 0; i < N; i++) std::printf("%d ", seq_preds[i]);
+        std::printf("\n");
+
+        // Restore target state + reset cur_pos.
+        restore_ssm_state(c_tgt);
+        c_tgt.cur_pos = P;
+
+        // Batched at various N values (fresh snapshot+restore each time).
+        int32_t all_inputs[8] = { tp,
+            seq_preds[0], seq_preds[1], seq_preds[2], seq_preds[3],
+            seq_preds[4], seq_preds[5], seq_preds[6] };
+        for (int try_n = 1; try_n <= N; try_n++) {
+            restore_ssm_state(c_tgt);
+            c_tgt.cur_pos = P;
+            StepGraph sg_try; std::vector<uint16_t> mbt;
+            std::vector<float> ebt(w_tgt.n_embd * try_n), lbt;
+            int32_t out_try[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+            verify_batch(w_tgt, c_tgt, backend, sg_try,
+                         all_inputs, try_n, P, ebt, lbt, mbt, out_try);
+            step_graph_free(sg_try);
+            std::printf("[diag] batched N=%d:", try_n);
+            for (int i = 0; i < try_n; i++)
+                std::printf(" %d%s", out_try[i], out_try[i] == seq_preds[i] ? "" : "!");
+            std::printf("\n");
+        }
+        // Restore + batched N=4 on the same sequence.
+        restore_ssm_state(c_tgt);
+        c_tgt.cur_pos = P;
+        StepGraph sg_batch;
+        int32_t inputs[4] = { tp, seq_preds[0], seq_preds[1], seq_preds[2] };
+        std::vector<uint16_t> mbuf;
+        std::vector<float> embed_batch(w_tgt.n_embd * N), logits_batch;
+        verify_batch(w_tgt, c_tgt, backend, sg_batch,
+                     inputs, N, P, embed_batch, logits_batch, mbuf, batch_preds);
+        std::printf("[diag] batch #1: ");
+        for (int i = 0; i < N; i++) std::printf("%d ", batch_preds[i]);
+        std::printf("\n");
+
+        // Run it AGAIN without rebuild. K/V slots P..P+N-1 now contain the
+        // correct writes from batch #1 (matching what sequential would have
+        // written). If batch #2 gives correct pos 0, the bug is a write-before-
+        // read ordering issue where flash_attn_ext reads slot P BEFORE the
+        // cpy op for position 0 has landed.
+        restore_ssm_state(c_tgt);
+        c_tgt.cur_pos = P;
+        int32_t batch_preds2[4];
+        verify_batch(w_tgt, c_tgt, backend, sg_batch,
+                     inputs, N, P, embed_batch, logits_batch, mbuf, batch_preds2);
+        std::printf("[diag] batch #2: ");
+        for (int i = 0; i < N; i++) std::printf("%d ", batch_preds2[i]);
+        std::printf("\n");
+        step_graph_free(sg_batch);
+        for (int i = 0; i < N; i++) batch_preds[i] = batch_preds2[i];
+        std::printf("[diag] batch: ");
+        for (int i = 0; i < N; i++) std::printf("%d ", batch_preds[i]);
+        std::printf("\n");
+
+        bool match = true;
+        for (int i = 0; i < N; i++) if (seq_preds[i] != batch_preds[i]) { match = false; break; }
+        std::printf("[diag] %s\n", match ? "PASS: seq == batch" : "FAIL: batch != seq");
+        return match ? 0 : 1;
+    }
 
     // Prefill: run both models on the full prompt sequentially. After this,
     // both caches are at cur_pos = prompt.size(). last_tok_to_feed is the
