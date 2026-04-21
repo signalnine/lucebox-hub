@@ -12,6 +12,53 @@ hybrid + Q4_K_M and extends each layer with what the MoE/MXFP4 variant needs.
 
 ---
 
+## Status (`qwen36-port` branch on the `signalnine` fork)
+
+| Milestone | State | Notes |
+|---|---|---|
+| **M0** — arch + MXFP4 CUDA sanity | ✅ | `general.architecture=qwen35moe`, hybrid DeltaNet + MoE. `llama-bench`: 6,472 pp512 / 210.7 tg128 via the pinned fork. |
+| **M1a** — dual-arch scaffolding | ✅ | `TargetWeights.arch` tag, MoE fields on `TargetLayer`, shared loader for `qwen35` and `qwen35moe`, `build_target_graph()` dispatch. |
+| **M1b** — 35B-A3B graph builder | ✅ | `qwen36_target_graph.cpp` with the full stack: Q-packed full-attn (IMROPE) + fused-op DeltaNet + MoE FFN (`ggml_mul_mat_id` on MXFP4 gate/up + normalized-weight sum) + shared expert (sigmoid-scalar gate). End-to-end coherent output on "The capital of France is" → "Paris, a city renowned for its iconic landmarks such as". **125.8 tok/s decode**, ~60 % of llama.cpp's 210.7 baseline. |
+| **M2a** — runtime-dim qwen35 builder | ✅ | `build_full_attn_block` / `build_delta_net_block` / `create_target_cache` now read `w.n_*` / `w.ssm_*` at runtime, not q35:: constants. Loader accepts any qwen35 size and tied LM head. Rope type standardised to `GGML_ROPE_TYPE_IMROPE` for both arches. Qwen3.5-0.8B-BF16 now loads + runs through the same engine as 27B and 35B. |
+| **M2b** — chain-spec orchestrator | 🚧 in progress | Load 0.8B draft + 35B target side by side, draft proposes *N* tokens, target verifies in one forward, rollback SSM+KV on mismatch. |
+| M3 — DDTree verify on MoE | ☐ | Tree-mode SSM ops already wired through the graph (parent_ids path); driver changes only. |
+| M4 — full bench + throughput tuning | ☐ | Close 125 → 200+ tok/s gap (likely KV type, MoE routing microcode). |
+| M5 — DFlash-trained draft | ☐ | Stretch; 3-5 days H100 time. |
+
+### Numbers shipped so far
+
+| Model (arch) | First-token correctness | Decode tok/s (our engine) | llama.cpp AR baseline |
+|---|---|:-:|:-:|
+| Qwen3.5-0.8B (qwen35 dense) | ✓ " Paris." | 300 | — |
+| Qwen3.6-35B-A3B MXFP4 (qwen35moe) | ✓ " Paris, a city renowned for its iconic landmarks…" | 125.8 | 210.7 |
+
+### Key lessons from the port so far
+
+1. **Arch-family commonality is higher than I initially expected.** The DeltaNet
+   + FullAttn layer dispatch, SSM state layout, RMS+gate output norm,
+   sigmoid-gated Q-packed attention — all identical across 0.8B, 27B, and the
+   35B-A3B MoE variant. The single hybrid builder with runtime dims handles
+   all three.
+2. **MXFP4 CUDA support is already in our pinned `Luce-Org/llama.cpp@luce-dflash`
+   submodule.** No kernel work needed; `GGML_TYPE_MXFP4` has registered dequant
+   and `ggml_mul_mat_id` paths. One fewer upstream dependency.
+3. **Qwen3.5 and Qwen3.5-MoE both use `GGML_ROPE_TYPE_IMROPE` (40), not `MROPE`
+   (8).** Our original 27B code used MROPE and produced coherent output, but
+   the llama.cpp-canonical type is IMROPE. We've switched to it for all qwen35
+   sizes; the 35B's coherent output confirms it's the right call.
+4. **Tied LM head handling** (the 0.8B has no `output.weight`; it aliases
+   `token_embd.weight`). Cheap to support — upload the embedding table to GPU
+   *in addition to* the CpuEmbedder row-lookup path, and alias `w.output ←
+   w.tok_embd`.
+5. **Chain-spec with matching tokenizer requires a same-family model.** The
+   natural-looking "small Qwen3-1.7B as draft" path fails because Qwen3.x uses
+   a 151,643-vocab tokenizer while Qwen3.5+ uses 248,320. Only *Qwen3.5-0.8B*
+   is publicly available in the target's tokenizer family. Our megakernel
+   project target gets reused as the DFlash draft — one fewer model family to
+   support.
+
+---
+
 ## Scope & non-goals
 
 **In scope**
