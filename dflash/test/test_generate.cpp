@@ -66,11 +66,12 @@ static bool build_step_graph(
     const TargetWeights & w,
     TargetCache & cache,
     ggml_backend_t backend,
-    int kv_start
+    int kv_start,
+    int n_tokens = 1
 ) {
     if (!sg.ctx) {
         ggml_init_params ip{};
-        ip.mem_size   = 256 * 1024 * 1024;
+        ip.mem_size   = 512 * 1024 * 1024;   // larger arena — batched prefill needs it
         ip.mem_buffer = nullptr;
         ip.no_alloc   = true;
         sg.ctx = ggml_init(ip);
@@ -79,14 +80,13 @@ static bool build_step_graph(
         ggml_reset(sg.ctx);
     }
 
-    const int n_tokens = 1;
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_input(sg.inp_embed);
     ggml_set_input(sg.positions);
 
-    // KV write index: one i64 per new token. For decode it's just [kv_start].
+    // KV write indices: one i64 per new token, values kv_start..kv_start+n_tokens-1.
     sg.kv_pos_idx = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I64, n_tokens);
     ggml_set_input(sg.kv_pos_idx);
 
@@ -97,7 +97,8 @@ static bool build_step_graph(
     constexpr int KV_PAD_ALIGN = 256;
     const int kv_len     = kv_start + n_tokens;
     const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
-    const int q_pad      = 32;   // KQ_MASK_PAD
+    // q_pad must cover n_tokens AND align to fattn's 32-row expectation.
+    const int q_pad      = ((n_tokens + 31) / 32) * 32;
     sg.attn_mask   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
     ggml_set_input(sg.attn_mask);
     sg.n_kv_padded = n_kv_padded;
@@ -285,13 +286,100 @@ int main(int argc, char ** argv) {
         return best;
     };
 
-    // ── Prefill: feed prompt tokens one at a time (decode-only mode).
-    //    We throw away the logits for all prompt tokens except the last one.
+    // ── Batched prefill: process prompt in chunks of PREFILL_CHUNK so the
+    //    target sees each chunk as a single multi-token forward. At N=256
+    //    the forward amortises weight-load + quantize_q8_1 over 256 tokens,
+    //    giving ~20x speedup vs the old N=1-per-prompt-token path.
+    //    Only the LAST chunk's last position's logits matter (they seed the
+    //    decode loop); logits from earlier chunks are just written-then-
+    //    discarded.
+    auto run_prefill_chunk = [&](const int32_t * toks, int start_pos, int chunk_n) -> int32_t {
+        if (!build_step_graph(sg, w, cache, backend, start_pos, chunk_n)) {
+            std::fprintf(stderr, "build_step_graph failed prefill pos=%d n=%d\n", start_pos, chunk_n);
+            std::exit(1);
+        }
+
+        // CPU embed: chunk_n tokens laid out contiguously.
+        std::vector<float> chunk_embed((size_t)hidden * chunk_n);
+        if (!w.embedder.embed(toks, chunk_n, chunk_embed.data())) {
+            std::fprintf(stderr, "prefill embed failed\n"); std::exit(1);
+        }
+        ggml_backend_tensor_set(sg.inp_embed, chunk_embed.data(), 0,
+                                sizeof(float) * chunk_embed.size());
+
+        // M-RoPE axis-major positions: [axis, token], first 3 axes = abs pos,
+        // axis 3 = 0 for plain text.
+        std::vector<int32_t> pos4((size_t)4 * chunk_n);
+        for (int i = 0; i < chunk_n; i++) {
+            const int p = start_pos + i;
+            pos4[0 * chunk_n + i] = p;
+            pos4[1 * chunk_n + i] = p;
+            pos4[2 * chunk_n + i] = p;
+            pos4[3 * chunk_n + i] = 0;
+        }
+        ggml_backend_tensor_set(sg.positions, pos4.data(), 0,
+                                sizeof(int32_t) * pos4.size());
+
+        // KV write indices: sequential slots start_pos..start_pos+chunk_n-1.
+        std::vector<int64_t> kv_idxs(chunk_n);
+        for (int i = 0; i < chunk_n; i++) kv_idxs[i] = (int64_t)(start_pos + i);
+        ggml_backend_tensor_set(sg.kv_pos_idx, kv_idxs.data(), 0,
+                                sizeof(int64_t) * kv_idxs.size());
+
+        // Causal mask over the padded n_kv range. q_pad = align_up(chunk_n, 32);
+        // pad rows copy the last real row (NaN guard) — same convention as
+        // test_chain_spec.
+        const int kv_len = start_pos + chunk_n;
+        const int q_pad  = ((chunk_n + 31) / 32) * 32;
+        std::vector<uint16_t> mask((size_t)sg.n_kv_padded * q_pad, /*F16 -inf*/ 0xFC00);
+        for (int q = 0; q < chunk_n; q++) {
+            const int max_k = start_pos + q;
+            for (int k = 0; k <= max_k && k < sg.n_kv_padded; k++) {
+                mask[(size_t)q * sg.n_kv_padded + k] = /*F16 zero*/ 0x0000;
+            }
+        }
+        for (int q = chunk_n; q < q_pad; q++) {
+            std::memcpy(&mask[(size_t)q * sg.n_kv_padded],
+                        &mask[(size_t)(chunk_n - 1) * sg.n_kv_padded],
+                        sizeof(uint16_t) * sg.n_kv_padded);
+        }
+        ggml_backend_tensor_set(sg.attn_mask, mask.data(), 0,
+                                sizeof(uint16_t) * mask.size());
+
+        auto st = ggml_backend_graph_compute(backend, sg.gf);
+        if (st != GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "prefill compute failed (%d)\n", (int)st); std::exit(1);
+        }
+
+        // Only need the LAST position's logits (to seed decode). Logits
+        // tensor shape is [vocab, chunk_n]; last row offset = (chunk_n-1)*vocab*4.
+        const int vocab = (int)w.embedder.n_vocab;
+        std::vector<float> last_logits(vocab);
+        const size_t row_off = (size_t)(chunk_n - 1) * vocab * sizeof(float);
+        ggml_backend_tensor_get(sg.logits, last_logits.data(), row_off,
+                                sizeof(float) * vocab);
+        int best = 0;
+        float bv = last_logits[0];
+        for (int i = 1; i < vocab; i++) {
+            if (last_logits[i] > bv) { bv = last_logits[i]; best = i; }
+        }
+        return best;
+    };
+
+    constexpr int PREFILL_CHUNK = 256;
     int next = -1;
-    for (int i = 0; i < (int)prompt.size(); i++) {
-        next = run_step(prompt[i], i);
+    auto t_prefill_start = now_us();
+    for (int start = 0; start < (int)prompt.size(); start += PREFILL_CHUNK) {
+        const int chunk_n = std::min(PREFILL_CHUNK, (int)prompt.size() - start);
+        next = run_prefill_chunk(prompt.data() + start, start, chunk_n);
     }
-    std::printf("[prefill] last-token argmax=%d\n", next);
+    auto t_prefill_end = now_us();
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        t_prefill_end - t_prefill_start).count();
+    std::printf("[prefill] %zu tokens in %.3f s → %.2f tok/s; last-token argmax=%d\n",
+                prompt.size(), prefill_ms / 1000.0,
+                prompt.size() * 1000.0 / std::max(1e-9, prefill_ms),
+                next);
 
     // ── Generation loop
     auto t_start = std::chrono::steady_clock::now();
