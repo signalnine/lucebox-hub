@@ -221,3 +221,90 @@ DFLASH_DRAFT=$(pwd)/models/draft/model.safetensors \
 - Published DFlash paper on Qwen3-4B/8B/30B-MoE (pure attention, BF16, B200) reports 4-5× over AR on HumanEval/Math500 at concurrency 1. Ours: 3.43× on 27B hybrid Q4_K_M on RTX 3090.
 - Memory ceiling: per-token SSM intermediate cache (hybrid-only cost) caps tree budget at ~26 on 24 GB. The paper uses budgets up to 1024 on pure-attention models with zero per-node memory tax.
 - Per-token verify cost drops from 25 ms at N=1 to 0.97 ms at N=128 (ggml-cuda Q4_K matmul amortises well with batch size).
+
+---
+
+## Qwen3.6-35B-A3B-MXFP4_MOE (5090, `qwen36-port` branch)
+
+Second target arch: `qwen35moe` (per llama.cpp naming). 64 layers, 3:1 DeltaNet:Attn interleave, 256 MXFP4 experts × top-8, shared expert on every layer. The `qwen36-port` branch ported dflash's 27B engine to this arch, then closed the throughput gap to llama.cpp via a series of kernel-dispatch and cache-layout fixes (see `docs/port-qwen36-35b-a3b-moe.md` for the milestone-by-milestone trace).
+
+Setup: RTX 5090 (Blackwell consumer, 32 GB, sm_120), CUDA 13.2, `-DCMAKE_CUDA_ARCHITECTURES=120`. Target `unsloth/Qwen3.6-35B-A3B-GGUF` (MXFP4_MOE, 20.2 GB). Draft for spec-decode is the generic `Qwen3.5-0.8B-BF16` dense model (no purpose-built DFlash draft yet — M5 stretch). `n_gen=256`, greedy decoding, 5 prompts/dataset, seed 42. Reproduce with `scripts/bench_chain_spec.py` (M4 driver).
+
+### Headline — AR at parity with llama.cpp
+
+| Decode path                     | Code prompt (fibonacci) | tg128 (llama-bench)       |
+|---------------------------------|:-----------------------:|:-------------------------:|
+| **`test_generate` AR (ours)**   | **213 tok/s** (+66% vs M1b) | —                          |
+| `llama-bench tg128`             | —                         | 211–235 tok/s (varies by P-state) |
+
+The M1b port baseline was 125 tok/s (60% of llama.cpp). Three commits closed the gap:
+
+1. **swiglu-split fusion** (`499c176`) — emit `ggml_swiglu_split(gate, up)` instead of `silu(gate) * up`. ggml-cuda's `ggml_cuda_should_fuse_mul_mat_vec_q` pattern-matcher folds both `mul_mat_id` + GLU into one mmvq with `has_fusion=true`. nsys shows MXFP4 mmvq 78→39/step (matches llama.cpp exactly) and Q8_0 mmvq 201→121.
+
+2. **persistent ggml context** (`499c176`) — `ggml_reset(ctx)` re-uses the arena instead of `ggml_free` + `ggml_init`. Tensors re-land at stable addresses so `cgraph->nodes[0]` stays pointer-stable across steps — the precondition for ggml-cuda's CUDA-graph cache.
+
+3. **KV cache layout + `ggml_set_rows`** (`4c16107`) — switch cache from `[head_dim, max_ctx, n_head_kv]` to llama.cpp's `[n_embd_gqa, max_ctx]`, replace view-offset KV writes with `ggml_set_rows(cache, k_cur, kv_pos_idx)` where `kv_pos_idx` is an input tensor, and pad `n_kv` to `GGML_PAD(kv_len, 256)`. Graph shape is now stable across 256-step windows so ggml-cuda's 2-step `warmup_complete` latches and subsequent steps become single `cudaGraphLaunch` calls. Kernel instance count per step: Q8_0 mmvq from 7437/37steps pre-refactor to **121/37steps post-refactor** (~1 capture amortised over 36 graph launches). `compute=6208→4252 µs/step` (−31%).
+
+### Spec-decode on HumanEval + GSM8K (n=5, n_gen=256, N_spec=8)
+
+With the 0.8B dense draft:
+
+| Mode                      | HumanEval tok/s | HE AL  | HE ×AR  | GSM8K tok/s | GSM8K AL | GSM8K ×AR |
+|---------------------------|:---------------:|:------:|:-------:|:-----------:|:--------:|:---------:|
+| `test_generate` AR        | **212.25**      | —      | 1.00    | **212.33**  | —        | 1.00      |
+| `CHAIN_VERIFY=seq`        | 112.78          | 6.82   | 0.53    | 100.34      | 5.46     | 0.47      |
+| `CHAIN_VERIFY=batch`      | 163.92          | 7.37   | 0.77    | 116.29      | 5.68     | 0.55      |
+| `CHAIN_VERIFY=tree_chain` | **168.98**      | 7.37   | **0.80**| **122.77**  | 5.68     | **0.58**  |
+| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 119.82 | 7.01 | 0.56   | 106.89      | 6.30     | 0.50      |
+
+No mode beats AR at this draft/target ratio — the 0.8B draft is too weak relative to the 35B MoE target for chain-spec's per-round overhead to amortise. But every mode is coherent and `tree_chain` closes to 0.58–0.80× AR depending on prompt variance. DDTree's relative disadvantage grew after the ttx work because draft catch-up (`N_spec` sequential 0.8B forwards per round) is the same absolute cost as before but now a larger fraction of each round's wall time — the refactor sped up the target without speeding up the draft.
+
+DDTree still wins on specific low-AL prompts. For example GSM8K sample 2 (a math word problem where the 0.8B draft disagrees with target 51% of the time): batch 83 tok/s → DDTree 92 tok/s (+11%) via sibling walks. The case for DDTree becomes compelling once the draft is strong enough that trees often pay back their per-round overhead — which points at M5 (trained block-diffusion draft, paper-style) or at a mid-size dense draft (3B/7B Qwen in place of 0.8B).
+
+### Comparison — before vs after the cache-layout refactor
+
+Same driver, same prompts, same N_spec, same seed:
+
+| dataset   | mode          | before (M4) | after (post-ttx) | Δ      |
+|-----------|---------------|:-----------:|:----------------:|:------:|
+| HumanEval | AR            | 125.7       | **212.3**        | +69%   |
+|           | seq           | 72.7        | 112.8            | +55%   |
+|           | batch         | 121.4       | 163.9            | +35%   |
+|           | tree_chain    | 121.1       | 169.0            | +39%   |
+|           | ddtree K=8 B=22 | 105.2     | 119.8            | +14%   |
+| GSM8K     | AR            | 125.8       | **212.3**        | +69%   |
+|           | seq           | 63.3        | 100.3            | +58%   |
+|           | batch         | 72.5        | 116.3            | +60%   |
+|           | tree_chain    | 72.6        | 122.8            | +69%   |
+|           | ddtree K=8 B=22 | 78.9      | 106.9            | +35%   |
+
+Raw per-sample JSON in `dflash/scripts/bench_post_ttx_reference.json`.
+
+### Reproducibility (qwen36-port, 5090)
+
+```bash
+# AR baseline
+build/test_generate $TGT prompt.bin 256 out.bin
+
+# Spec-decode bench (5 HE + 5 GSM8K, all modes)
+DFLASH_TARGET=$TGT DFLASH_DRAFT=$DRAFT_08B \
+  python3 scripts/bench_chain_spec.py \
+    --dataset all --n-sample 5 --n-gen 256 --n-spec 8 \
+    --modes seq,batch,tree_chain,ddtree \
+    --ddtree-k 8 --ddtree-budget 22
+```
+
+Where `$TGT` is `Qwen3.6-35B-A3B-MXFP4_MOE.gguf` and `$DRAFT_08B` is any qwen35-family dense GGUF with matching vocab (we used `Qwen3.5-0.8B-BF16.gguf`). The `bench_chain_spec.py` driver also writes a JSON report with per-sample stats (AL, sibling walks for DDTree, tok/s).
+
+### 27B regression (sanity check post-refactor)
+
+The M2a + ttx refactor touched `qwen35_target_graph.cpp` which is shared with the 27B `qwen35` arch. Re-ran the 27B DFlash bench on 5090 with the `jks` issue's methodology:
+
+| Prompt (HE sample) | Pre-refactor (3090 baseline) | Post-refactor (5090) | AL    |
+|--------------------|:----------------------------:|:--------------------:|:-----:|
+| sample 00          | —                             | 134.45 tok/s         | 9.48  |
+| sample 01          | —                             | 155.79 tok/s         | 11.13 |
+| sample 02          | —                             | 139.83 tok/s         | 9.85  |
+| **mean**           | 129.5 (3090, pre-refactor)    | **143.36 (5090)**    | 10.15 |
+
++10.7% over the 3090 3-prompt baseline; no semantic regression (output fully coherent). The absolute number is above baseline because of the GPU change; the important signal is that the per-step timing breakdown is stable and DFlash still converges to its expected AL on a well-matched draft.
