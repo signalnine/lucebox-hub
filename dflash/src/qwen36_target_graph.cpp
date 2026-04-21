@@ -95,24 +95,43 @@ static ggml_tensor * build_moe_ffn_qwen36(
     const int64_t n_expert      = q36::N_EXPERT;
     const int64_t n_expert_used = q36::N_EXPERT_USED;
 
+    // Router + top-k + normalize. The exact op sequence matters:
+    // ggml-cuda's ggml_cuda_topk_moe_fusion pattern-matches
+    //
+    //   SOFTMAX -> RESHAPE -> ARGSORT -> VIEW -> GET_ROWS
+    //   [ -> RESHAPE -> SUM_ROWS -> CLAMP -> DIV -> RESHAPE ]  (optional norm)
+    //
+    // into one fused topk_moe_cuda launch. The `src` links must be exact: the
+    // RESHAPE after SOFTMAX is "probs_reshaped", the ARGSORT must take the
+    // ORIGINAL softmax (src = nodes[node_idx - 2]), and GET_ROWS takes
+    // (probs_reshaped, view(argsort)). Any divergence kills the fusion.
+
     // 1. Router logits
     ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);
     ggml_set_name(logits, "moe_logits");
 
-    // 2. Softmax → probs
+    // 2. Softmax → probs  (remains the "original" softmax tensor — argsort
+    //    takes this below, fusion requires ARGSORT.src[0] == SOFTMAX).
     ggml_tensor * probs = ggml_soft_max(ctx, logits);
     ggml_set_name(probs, "moe_probs");
 
-    // 3. Top-k selection
+    // 3. RESHAPE of SOFTMAX — must appear in the graph immediately after
+    //    softmax for the fusion matcher (walks cgraph->nodes sequentially).
+    //    DFS traversal from any downstream user of probs_3d will append
+    //    this right after SOFTMAX.
+    ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
+    ggml_set_name(probs_3d, "moe_probs_reshaped");
+
+    // 4. Top-k selection on the ORIGINAL softmax (not the reshape). Expands
+    //    to ARGSORT → VIEW; GET_ROWS picks up the VIEW.
     ggml_tensor * selected = ggml_argsort_top_k(ctx, probs, n_expert_used);
     ggml_set_name(selected, "moe_topk");
 
-    // 4. Gather selected probabilities
-    probs = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
-    ggml_tensor * weights = ggml_get_rows(ctx, probs, selected);
+    // 5. GET_ROWS(probs_reshaped, view(argsort)) → raw top-k weights.
+    ggml_tensor * weights = ggml_get_rows(ctx, probs_3d, selected);
     ggml_set_name(weights, "moe_weights_raw");
 
-    // 5. Normalize weights to sum to 1
+    // 6. Normalize: RESHAPE → SUM_ROWS → CLAMP → DIV → RESHAPE.
     weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tokens);
     ggml_tensor * wsum = ggml_sum_rows(ctx, weights);
     wsum = ggml_clamp(ctx, wsum, 6.103515625e-5f, INFINITY);
@@ -121,16 +140,19 @@ static ggml_tensor * build_moe_ffn_qwen36(
     ggml_set_name(weights, "moe_weights_normed");
     ggml_build_forward_expand(gf, weights);
 
-    // 6. Route cur through top-k experts' gate and up projections
+    // 6. Route cur through top-k experts' gate and up projections. The two
+    //    mul_mat_id + swiglu_split triplet is pattern-matched in ggml-cuda
+    //    (see ggml_cuda_should_fuse_mul_mat_vec_q) into ONE mmvq kernel with
+    //    has_fusion=true, instead of two separate gate/up mmvq calls + a
+    //    separate silu + mul. Using ggml_swiglu_split (GLU op) rather than
+    //    silu(gate) * up is the key — the raw op form doesn't fuse.
     cur = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
     ggml_tensor * gate_out = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur, selected);
     ggml_tensor * up_out   = ggml_mul_mat_id(ctx, L.ffn_up_exps,   cur, selected);
     ggml_set_name(gate_out, "moe_gate");
     ggml_set_name(up_out,   "moe_up");
-
-    gate_out = ggml_silu(ctx, gate_out);
-    ggml_tensor * gu = ggml_mul(ctx, gate_out, up_out);
-    ggml_set_name(gu, "moe_gate_silu_mul_up");
+    ggml_tensor * gu = ggml_swiglu_split(ctx, gate_out, up_out);
+    ggml_set_name(gu, "moe_swiglu");
 
     // 7. Down projection → [n_embd, n_expert_used, n_tokens]
     ggml_tensor * experts = ggml_mul_mat_id(ctx, L.ffn_down_exps, gu, selected);
@@ -158,10 +180,12 @@ static ggml_tensor * build_moe_ffn_qwen36(
 // scaled per-token by sigmoid(ffn_gate_inp_shexp @ cur).
 static ggml_tensor * build_shexp_qwen36(ggml_context * ctx, const TargetLayer & L,
                                         ggml_tensor * cur, int /*n_tokens*/) {
+    // Same gate/up/swiglu fusion trick as build_moe_ffn_qwen36 — using
+    // ggml_swiglu_split lets ggml-cuda fuse the two mmvq's + silu + mul into
+    // one kernel with has_fusion=true.
     ggml_tensor * gate = ggml_mul_mat(ctx, L.ffn_gate_shexp, cur);   // [FFN_SHEXP, n_tokens]
-    gate = ggml_silu(ctx, gate);
     ggml_tensor * up   = ggml_mul_mat(ctx, L.ffn_up_shexp,   cur);   // [FFN_SHEXP, n_tokens]
-    ggml_tensor * gu   = ggml_mul(ctx, gate, up);
+    ggml_tensor * gu   = ggml_swiglu_split(ctx, gate, up);
     ggml_tensor * out  = ggml_mul_mat(ctx, L.ffn_down_shexp, gu);    // [HIDDEN, n_tokens]
 
     // Shared-expert sigmoid gate (one scalar per token).

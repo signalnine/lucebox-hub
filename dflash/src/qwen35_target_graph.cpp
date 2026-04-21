@@ -268,10 +268,11 @@ static ggml_tensor * rms_norm_mul(ggml_context * ctx, ggml_tensor * x,
 
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
+    // Use ggml_swiglu_split so ggml-cuda fuses the two gate/up mmvq's + silu +
+    // mul into one mmvq-with-fusion launch (has_fusion=true). See ttx notes.
     ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
-    gate = ggml_silu(ctx, gate);
-    ggml_tensor * up = ggml_mul_mat(ctx, L.w_up, cur);
-    ggml_tensor * gu = ggml_mul(ctx, gate, up);
+    ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up,   cur);   // [inter, n_tokens]
+    ggml_tensor * gu   = ggml_swiglu_split(ctx, gate, up);
     return ggml_mul_mat(ctx, L.w_down, gu);                  // [hidden, n_tokens]
 }
 

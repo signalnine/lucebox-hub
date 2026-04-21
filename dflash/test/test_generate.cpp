@@ -44,13 +44,20 @@ struct StepGraph {
 // Build a fresh single-token forward graph. We rebuild per step so that
 // `kv_start` updates drive the correct KV cache slot. The graph is cheap to
 // rebuild — all the weights + KV cache stay persistent.
-// Build a per-step forward graph. The ggml ctx + graph are rebuilt each call
-// (they're cheap CPU-side tensor descriptors), but the CUDA allocator
-// `sg.alloc` is created once and reused — ggml_gallocr reallocates its
-// backing CUDA buffer lazily only when the graph's peak working set grows,
-// which never happens in AR decode where every step has the same n_tokens=1
-// shape. This avoids ~1-3 ms of cudaMalloc/cudaFree per step, which was
-// dominating tok/s on RTX 5090 where each forward is only ~5 ms.
+// Build a per-step forward graph. Three persistent resources survive across
+// steps, which matters for decode throughput:
+//
+//   1. ggml_context — `ggml_reset(ctx)` moves the arena bump pointer back
+//      to 0 without freeing the underlying memory. After reset, the next
+//      ggml_new_tensor_* calls land at the SAME addresses as last step, so
+//      cgraph->nodes[0] is pointer-stable across steps. ggml-cuda keys its
+//      captured CUDA graph on nodes[0] — pointer-stable keys are what let
+//      it call cudaGraphExecUpdate on subsequent steps instead of re-
+//      capturing. With GGML_CUDA_GRAPHS=ON this is the big win.
+//   2. ggml_gallocr — skips cudaMalloc/cudaFree of the multi-GB working
+//      set every step.
+//   3. CUDA graph cache (inside ggml-cuda) — keyed by nodes[0]; reused
+//      only because of (1).
 static bool build_step_graph(
     StepGraph & sg,
     const TargetWeights & w,
@@ -58,14 +65,16 @@ static bool build_step_graph(
     ggml_backend_t backend,
     int kv_start
 ) {
-    if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
-
-    ggml_init_params ip{};
-    ip.mem_size   = 256 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
+    if (!sg.ctx) {
+        ggml_init_params ip{};
+        ip.mem_size   = 256 * 1024 * 1024;
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        sg.ctx = ggml_init(ip);
+        if (!sg.ctx) return false;
+    } else {
+        ggml_reset(sg.ctx);
+    }
 
     const int n_tokens = 1;
     const int hidden = w.n_embd;
