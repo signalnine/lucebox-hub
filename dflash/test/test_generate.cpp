@@ -366,7 +366,7 @@ int main(int argc, char ** argv) {
         return best;
     };
 
-    constexpr int PREFILL_CHUNK = 256;
+    constexpr int PREFILL_CHUNK = 1024;
     int next = -1;
     auto t_prefill_start = now_us();
     for (int start = 0; start < (int)prompt.size(); start += PREFILL_CHUNK) {
