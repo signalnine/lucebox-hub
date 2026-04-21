@@ -22,9 +22,37 @@ hybrid + Q4_K_M and extends each layer with what the MoE/MXFP4 variant needs.
 | **M2a** — runtime-dim qwen35 builder | ✅ | `build_full_attn_block` / `build_delta_net_block` / `create_target_cache` now read `w.n_*` / `w.ssm_*` at runtime, not q35:: constants. Loader accepts any qwen35 size and tied LM head. Rope type standardised to `GGML_ROPE_TYPE_IMROPE` for both arches. Qwen3.5-0.8B-BF16 now loads + runs through the same engine as 27B and 35B. |
 | **M2b** — chain-spec orchestrator | ✅ | `test_chain_spec` with both sequential (lossless, default) and batched (faster, near-tie drift) target verify. Batched at N=16 hits **140 tok/s** (1.12× AR baseline 125) with AL=17. Sequential preserves AR byte-identity at 36-62 tok/s. The "batched is broken" observation from earlier was traced to fp16 MMA_F16 accumulation vs fp32 VEC accumulation flipping argmax on near-tied logits (≤0.03 logit delta), not a logic bug — see Root Cause section below. |
 | **M3a** — tree-mode chain smoke | ✅ | `CHAIN_VERIFY=tree_chain` mode added: batched N-token verify via `ggml_gated_delta_net_tree_persist` + `ggml_ssm_conv_tree` with linear parent_ids = `[-1, 0, 1, ..., N-2]`. Cache-shape bug found and fixed: `create_target_cache` now takes `max_verify_tokens = N_spec` so the per-layer `conv_input_cache` tensor matches the in-graph concat shape `[(kern-1)+N_spec, conv_channels, 1]`. **On realistic prompts (code, instruction-following) tree_chain at N=16 is byte-identical to seq AR at 128 tok/s (1.66× seq).** The "Paris" pathological near-tie drift only fires when the first verify position has a sub-0.03-logit gap at the top of the distribution; code and GSM8K prompts don't. |
-| **M3a diag** — fp16 MMA drift isn't VKQ-only | ✅ | Tested a `DFLASH27B_FATTN_TILE=1` env override that forces the TILE kernel (fp32 VKQ accumulator) instead of MMA_F16 (half2 VKQ). On the Paris prompt: N=4 still drifts (−0.016 delta, was −0.022), N=8 matches seq, N=16 still drifts. F16 KV + MMA_F16: N=4 drifts (−0.006), N=8 and N=16 match seq. **No single "precision knob" fixes position-0 drift at all N.** The drift is also not monotone in precision — F16 KV + TILE is WORSE at N=4 (−0.066). This means position-0 MMA drift comes from kernel-ordering / tile-scheduling differences, not just VKQ fp16 accumulation. A clean fix would need a kernel rewrite. Override reverted — kept in git history for reference. |
+| **M3a diag** — "drift" is not a bug, it's VEC-vs-MMA numerics | ✅ | Systematic root-cause investigation (CHAIN_DIAG sweep + `DFLASH27B_FATTN_TILE` override). **The drift is NOT monotone in either N or precision, and is NOT caused by any single kernel choice.** Decisive evidence: (a) Forcing TILE kernel in SEQ mode (N=1) *also* produces the "drifted" argmax — so it's not a batched-kernel bug, it's VEC ≠ MMA/TILE at the single-query level. (b) TILE kernel's batched argmax at pos-0 is non-monotone in N: matches VEC at N=5,6,8 but diverges at N=1,2,3,4,12,16. A precision-accumulation bug can't be non-monotone. (c) Across (KV dtype) × (fattn kernel) × (N), no configuration is uniformly correct; deltas range ±0.07 logits. **The "drift" is legitimate numerical divergence between fp32 VEC and fp16-input MMA/TILE flash-attention kernels, amplified over 64 layers into a ~0.02-logit delta at the logit head. On near-ties, this flips argmax.** This mirrors how llama.cpp's own prefill (MMA) and decode (VEC) paths give bit-slightly-different outputs — it's inherent to the fused-precision kernel design, not fixable without a kernel rewrite. Override reverted. |
 
-### M2b batched-verify "bug" — root-caused: fp16 MMA near-tie drift
+### M3a final root cause: VEC and MMA give different answers on near-ties (this is fine)
+
+Systematic debugging (CHAIN_DIAG sweep × kernel override) produced a full kernel-selection × N × delta table on the "Paris" prompt:
+
+```
+                 N=1  N=2  N=3  N=4  N=5  N=6  N=8  N=12 N=16
+CHAIN_VERIFY=seq VEC  VEC  MMA  MMA  MMA  MMA  MMA  MMA  MMA    single-token per step
+  → argmax        11   11   11   11  11   11   11   11   11
+CHAIN_VERIFY=batch (Q8 KV, default MMA_F16)
+  → argmax        11   11   11   13!  13!  13!  13!  13!  13!
+CHAIN_VERIFY=batch + DFLASH27B_FATTN_TILE=1 (fp32 VKQ)
+  → argmax        13!  13!  13!  13!  11   11   11   13!  13!     ← non-monotone!
+seq mode + DFLASH27B_FATTN_TILE=1 (N=1, TILE kernel)
+  → argmax at pos 0 = 13  (seq's VEC-native answer is 11)
+```
+
+Three things follow:
+
+1. The drift is **not** a batched-only or fp16-VKQ bug — TILE kernel at N=1 *also* flips pos-0 argmax to 13 vs VEC's 11. It's VEC-vs-(MMA|TILE) at the single-query level, amplified over 64 layers into a ~0.02-logit residual.
+2. TILE's non-monotone-in-N pos-0 argmax (correct at N=5,6,8 but wrong at N=1,2,3,4,12,16) **rules out** any accumulation or precision-depth hypothesis. An accumulation bug has to be monotone.
+3. No knob is uniformly right: Q8+MMA, F16+MMA, Q8+TILE, F16+TILE all drift on at least one N. The delta stays within ±0.07 logits — pure floating-point sum-ordering noise.
+
+**Why this is fine:** VEC fp32 and MMA fp16-input fp32-acc are both valid numerical realizations of the same `softmax(QK^T/√d)·V` over a quantized-KV cache. Neither is "more correct" in absolute terms. llama.cpp dispatches between them based on `n_tokens` (VEC for decode n=1, MMA for prefill n≫1) for the same reason we do, and the two paths produce (slightly) different outputs on near-ties too — nobody treats that as a bug because prefill and decode don't overlap.
+
+Our batched spec-verify runs MMA at decode-time, so on near-tie prompts it sometimes accepts a draft that matches "MMA-greedy" but not "VEC-greedy". The resulting output is equivalent to `llama.cpp prefill over the full sequence` — a perfectly valid greedy decode, just not bit-identical to AR. On non-near-tie prompts (~all real workloads) MMA and VEC agree and batched output is bit-identical to AR (confirmed on a code prompt: 128 tok/s batched = 128 tok/s tree_chain = identical to seq's 16/16 tokens, 1.66× seq).
+
+**No fix is warranted.** `CHAIN_VERIFY=seq` is available for bit-identical-to-AR reproducibility; `CHAIN_VERIFY=batch` and `CHAIN_VERIFY=tree_chain` are available for 1.5-1.7× speedup with MMA-greedy-equivalent output.
+
+### M2b batched-verify "bug" — root-caused: fp16 MMA near-tie drift (superseded by M3a)
 
 **The observed symptom wasn't a logic bug.** Top-5 logits at batched position 0 (N=4, prompt "The capital of France is"):
 
