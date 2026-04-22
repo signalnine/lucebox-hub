@@ -167,7 +167,12 @@ bool create_target_cache(const TargetWeights & w,
                                                   cache_conv_kern - 1, cache_conv_ch);
             ggml_tensor * Cn = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32,
                                                   cache_conv_kern - 1, cache_conv_ch);
-            ggml_tensor * Si = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F16,
+            // f32 (not f16) so fast-rollback restores bit-identical state
+            // to what step_model catch-up would produce. f16 persist loses
+            // ~10% AL on tree_chain vs batch on HE (rollback drift). Memory
+            // cost: 2x per-layer intermediate buffer, ~400 MB extra for
+            // the 35B MoE target at max_verify_tokens=1+budget=23.
+            ggml_tensor * Si = ggml_new_tensor_4d(out.ctx, GGML_TYPE_F32,
                                                   cache_head_v_dim, cache_head_v_dim,
                                                   cache_dt_rank, max_verify_tokens);
             ggml_tensor * Ci = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F32,
