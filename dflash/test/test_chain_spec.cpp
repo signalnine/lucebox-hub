@@ -1555,8 +1555,13 @@ int main(int argc, char ** argv) {
             //   - Chain-matched, commit_count == N_spec+1: extra step needed
             //     (the N_spec'th draft was never actually processed; only its
             //     argmax was captured). One step_model call.
-            //   - Sibling walk (DDTree only): checkpoints don't match the
-            //     accepted token sequence; fall back to sequential replay.
+            //   - Sibling walk with sibling_d > 0: accepted_tokens[0..sibling_d)
+            //     match the chain (by definition of sibling_d = first slot where
+            //     ddtree_accepted[i] != i), so checkpoint slot sibling_d is the
+            //     correct resume state. Step through the sibling tail only —
+            //     saves sibling_d draft forwards per sibling-walking round.
+            //   - Sibling walk with sibling_d == 0 (can't happen: root always
+            //     self-accepts): falls through to full sequential replay.
             if (accepted_matches_chain && use_draft_ckpt && commit_count <= N_spec) {
                 draft_ckpt_restore(draft_ckpt, c_drf, commit_count);
                 c_drf.cur_pos = pre_pos + commit_count;
@@ -1569,6 +1574,16 @@ int main(int argc, char ** argv) {
                                  drafts[N_spec - 1], pre_pos + N_spec,
                                  embed_drf, logits_drf);
                 c_drf.cur_pos = pre_pos + N_spec + 1;
+            } else if (walked_sibling && use_draft_ckpt
+                       && sibling_d > 0 && sibling_d <= N_spec) {
+                draft_ckpt_restore(draft_ckpt, c_drf, sibling_d);
+                c_drf.cur_pos = pre_pos + sibling_d;
+                for (int i = sibling_d; i < commit_count; i++) {
+                    (void)step_model(w_drf, c_drf, backend, sg_drf,
+                                     accepted_tokens[i], pre_pos + i,
+                                     embed_drf, logits_drf);
+                    c_drf.cur_pos = pre_pos + i + 1;
+                }
             } else {
                 catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
             }
