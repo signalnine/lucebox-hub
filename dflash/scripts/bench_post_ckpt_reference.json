@@ -1,0 +1,56 @@
+{
+  "HumanEval": {
+    "ar": 206.632,
+    "seq": {
+      "tps": 117.30799999999999,
+      "al": 6.818,
+      "sib_rate_pct": 0.0,
+      "speedup_vs_ar": 0.5677145843818963
+    },
+    "batch": {
+      "tps": 167.71800000000002,
+      "al": 7.367999999999999,
+      "sib_rate_pct": 0.0,
+      "speedup_vs_ar": 0.811674861589686
+    },
+    "tree_chain": {
+      "tps": 177.156,
+      "al": 6.622,
+      "sib_rate_pct": 0.0,
+      "speedup_vs_ar": 0.8573502652057765
+    },
+    "ddtree": {
+      "tps": 120.35,
+      "al": 7.008,
+      "sib_rate_pct": 31.580000000000002,
+      "speedup_vs_ar": 0.5824364086879089
+    }
+  },
+  "GSM8K": {
+    "ar": 207.158,
+    "seq": {
+      "tps": 106.55,
+      "al": 5.456,
+      "sib_rate_pct": 0.0,
+      "speedup_vs_ar": 0.5143417101922204
+    },
+    "batch": {
+      "tps": 121.668,
+      "al": 5.684,
+      "sib_rate_pct": 0.0,
+      "speedup_vs_ar": 0.5873198235163499
+    },
+    "tree_chain": {
+      "tps": 157.97,
+      "al": 5.828,
+      "sib_rate_pct": 0.0,
+      "speedup_vs_ar": 0.762558047480667
+    },
+    "ddtree": {
+      "tps": 108.234,
+      "al": 6.304,
+      "sib_rate_pct": 34.160000000000004,
+      "speedup_vs_ar": 0.5224707711022505
+    }
+  }
+}

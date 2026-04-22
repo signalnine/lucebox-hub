@@ -259,15 +259,19 @@ Was 285 tok/s at M1b. The 1024-token chunk size amortises the per-chunk CUDA-gra
 
 ### Spec-decode on HumanEval + GSM8K (n=5, n_gen=256, N_spec=8)
 
-With the 0.8B dense draft:
+With the 0.8B dense draft, after the **fast-rollback** work (commit `3d1ae5c`): per-step SSM checkpoint ring for the draft + tree_chain target rollback reusing DDTree's fast-rollback helper.
 
 | Mode                      | HumanEval tok/s | HE AL  | HE ×AR  | GSM8K tok/s | GSM8K AL | GSM8K ×AR |
 |---------------------------|:---------------:|:------:|:-------:|:-----------:|:--------:|:---------:|
-| `test_generate` AR        | **212.25**      | —      | 1.00    | **212.33**  | —        | 1.00      |
-| `CHAIN_VERIFY=seq`        | 112.78          | 6.82   | 0.53    | 100.34      | 5.46     | 0.47      |
-| `CHAIN_VERIFY=batch`      | 163.92          | 7.37   | 0.77    | 116.29      | 5.68     | 0.55      |
-| `CHAIN_VERIFY=tree_chain` | **168.98**      | 7.37   | **0.80**| **122.77**  | 5.68     | **0.58**  |
-| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 119.82 | 7.01 | 0.56   | 106.89      | 6.30     | 0.50      |
+| `test_generate` AR        | **206.63**      | —      | 1.00    | **207.16**  | —        | 1.00      |
+| `CHAIN_VERIFY=seq`        | 117.31          | 6.82   | 0.57    | 106.55      | 5.46     | 0.51      |
+| `CHAIN_VERIFY=batch`      | 167.72          | 7.37   | 0.81    | 121.67      | 5.68     | 0.59      |
+| `CHAIN_VERIFY=tree_chain` | **177.16**      | 6.62   | **0.86** | **157.97** | 5.83     | **0.76** |
+| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 120.35 | 7.01 | 0.58   | 108.23      | 6.30     | 0.52      |
+
+**tree_chain is now ~0.76-0.86× AR** — a 30% gain over the pre-fast-rollback numbers on GSM8K (was 0.58× AR at 122.77 tok/s). The win comes from replacing `commit_count × step_model` sequential catch-up calls — one 35B forward per accepted token, at ~5 ms each — with a batch of device-to-device `cudaMemcpyAsync` from the captured `ssm_intermediate` buffer. On GSM8K where AL is lower (5.8 vs 7.4 on HE), catch-up dominates per-round cost, so the savings are biggest.
+
+DDTree's gain from fast rollback is marginal here because its target path was already using fast rollback (that's what we originally built `ddtree_fast_rollback_target` for in M3c). The draft-side checkpoints help DDTree chain-walk rounds but siblings still require sequential draft replay.
 
 No mode beats AR at this draft/target ratio — the 0.8B draft is too weak relative to the 35B MoE target for chain-spec's per-round overhead to amortise. But every mode is coherent and `tree_chain` closes to 0.58–0.80× AR depending on prompt variance. DDTree's relative disadvantage grew after the ttx work because draft catch-up (`N_spec` sequential 0.8B forwards per round) is the same absolute cost as before but now a larger fraction of each round's wall time — the refactor sped up the target without speeding up the draft.
 
