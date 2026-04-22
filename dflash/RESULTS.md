@@ -259,24 +259,24 @@ Was 285 tok/s at M1b. The 1024-token chunk size amortises the per-chunk CUDA-gra
 
 ### Spec-decode on HumanEval + GSM8K (n=5, n_gen=256, N_spec=8)
 
-With the 0.8B dense draft, after the **GPU-argmax + graph-reuse** work (`51ac916`+`f5f60b3`) and fp32 ssm_intermediate (`c2ba531`):
+With the 0.8B dense draft, after **GPU-argmax + graph-reuse** (`51ac916`+`f5f60b3`), fp32 ssm_intermediate (`c2ba531`), and DDTree sibling-walk partial draft rollback (`da6a499`):
 
 | Mode                      | HumanEval tok/s | HE AL  | HE ×AR   | GSM8K tok/s | GSM8K AL | GSM8K ×AR |
 |---------------------------|:---------------:|:------:|:--------:|:-----------:|:--------:|:---------:|
-| `test_generate` AR        | **233.63**      | —      | 1.00     | **234.20**  | —        | 1.00      |
-| `CHAIN_VERIFY=seq`        | 130.31          | 6.82   | 0.56     | 118.40      | 5.46     | 0.51      |
-| `CHAIN_VERIFY=batch`      | 191.89          | 7.37   | 0.82     | 138.71      | 5.68     | 0.59      |
-| `CHAIN_VERIFY=tree_chain` | **205.03**      | 6.64   | **0.88** | **172.37**  | 5.44     | **0.74**  |
-| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 148.70 | 7.64 | 0.64 | 137.34 | 6.96 | 0.59 |
+| `test_generate` AR        | **233.63**      | —      | 1.00     | **234.32**  | —        | 1.00      |
+| `CHAIN_VERIFY=seq`        | 130.38          | 6.82   | 0.56     | 118.34      | 5.46     | 0.51      |
+| `CHAIN_VERIFY=batch`      | 191.68          | 7.37   | 0.82     | 138.51      | 5.68     | 0.59      |
+| `CHAIN_VERIFY=tree_chain` | **204.75**      | 6.64   | **0.88** | **172.28**  | 5.44     | **0.74**  |
+| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 153.65 | 7.64 | 0.66 | 142.43 | 6.96 | 0.61 |
 
 **On specific low-drift prompts `tree_chain` BEATS AR.** Best cases in the bench:
 
 | Prompt               | AR tok/s | tree_chain tok/s | Δ      | AL   |
 |----------------------|:--------:|:----------------:|:------:|:----:|
-| HE sample 3          | 232.82   | **248.29**       | +6.6%  | 8.37 |
-| GSM8K sample 1       | 234.08   | **248.22**       | +6.0%  | 8.20 |
+| HE sample 3          | 233.72   | **247.48**       | +5.9%  | 8.37 |
+| GSM8K sample 1       | 234.22   | **248.46**       | +6.1%  | 8.20 |
 
-Spec decode actually pays for itself once the draft-target AL is high enough to cover the per-round overhead. On GSM8K sample 5 the target/draft disagree on a near-tie (AL=3.13 for tree_chain), DDTree recovers via 23% sibling walks (AL=7.31, 147 tok/s — 49% faster than batch's 97.7).
+Spec decode actually pays for itself once the draft-target AL is high enough to cover the per-round overhead. On GSM8K sample 5 the target/draft disagree on a near-tie (AL=3.13 for tree_chain), DDTree recovers via 23% sibling walks (AL=7.31, 151 tok/s — 55% faster than batch's 97.4).
 
 AR decode 234 tok/s on 35B MXFP4 MoE **matches or slightly beats llama-bench tg256 (235) and tg1024 (234)** — we got there via the `qwen36-port` series:
 
@@ -284,7 +284,7 @@ AR decode 234 tok/s on 35B MXFP4 MoE **matches or slightly beats llama-bench tg2
 - KV cache layout + `ggml_set_rows`: 150 → 214 tok/s
 - GPU-side argmax + same-shape graph reuse: 214 → 234 tok/s
 
-The chain_spec propagation of the last of those is the reason spec-decode modes jumped 50-90% from the pre-fast-rollback bench snapshot.
+The chain_spec propagation of the last of those is the reason spec-decode modes jumped 50-90% from the pre-fast-rollback bench snapshot. DDTree sibling-walk partial checkpoint restore (`da6a499`) added another +3.5% on HE / +3.7% on GSM8K to DDTree by skipping draft forwards that the accepted path shares with the original chain — savings scale with `sibling_rate × sibling_d / commit_count`.
 
 ### Comparison — before vs after the cache-layout refactor
 
