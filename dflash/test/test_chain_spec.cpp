@@ -699,6 +699,63 @@ static void verify_tree(
     }
 }
 
+// ─── Draft SSM/conv checkpoint ring ─────────────────────────────────────
+//
+// Fast draft rollback: instead of `snapshot + replay commit_count forwards`
+// after verify, we save ssm_state + conv_state to a per-draft-step slot
+// DURING the initial drafting loop, then on rollback just cudaMemcpy the
+// saved slot back. Turns commit_count×step_drf (each ~2 ms for 0.8B) into
+// one ~400 µs batch of D2D copies per round.
+//
+// Valid only when the accepted path matches the draft's top-1 chain. If
+// DDTree accepts a sibling (accepted[i] != i), the state at slot
+// commit_count doesn't correspond to the accepted token sequence and we
+// must fall back to sequential replay.
+struct DraftCheckpoints {
+    int                                 n_slots   = 0;
+    int                                 n_delta   = 0;
+    std::vector<size_t>                 ssm_bytes;
+    std::vector<size_t>                 conv_bytes;
+    std::vector<std::vector<void *>>    ssm_bufs;   // [n_slots][n_delta]
+    std::vector<std::vector<void *>>    conv_bufs;
+};
+
+static bool draft_ckpt_alloc(DraftCheckpoints & ckpt, const TargetCache & c_drf, int n_slots) {
+    ckpt.n_slots = n_slots;
+    ckpt.n_delta = (int)c_drf.ssm_state.size();
+    ckpt.ssm_bytes.resize(ckpt.n_delta);
+    ckpt.conv_bytes.resize(ckpt.n_delta);
+    ckpt.ssm_bufs.assign(n_slots, std::vector<void *>(ckpt.n_delta, nullptr));
+    ckpt.conv_bufs.assign(n_slots, std::vector<void *>(ckpt.n_delta, nullptr));
+    for (int l = 0; l < ckpt.n_delta; l++) {
+        ckpt.ssm_bytes[l]  = ggml_nbytes(c_drf.ssm_state[l]);
+        ckpt.conv_bytes[l] = ggml_nbytes(c_drf.conv_state[l]);
+        for (int s = 0; s < n_slots; s++) {
+            if (cudaMalloc(&ckpt.ssm_bufs[s][l],  ckpt.ssm_bytes[l])  != cudaSuccess) return false;
+            if (cudaMalloc(&ckpt.conv_bufs[s][l], ckpt.conv_bytes[l]) != cudaSuccess) return false;
+        }
+    }
+    return true;
+}
+
+static void draft_ckpt_save(const DraftCheckpoints & ckpt, const TargetCache & c_drf, int slot) {
+    for (int l = 0; l < ckpt.n_delta; l++) {
+        cudaMemcpyAsync(ckpt.ssm_bufs[slot][l],  c_drf.ssm_state[l]->data,
+                        ckpt.ssm_bytes[l], cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(ckpt.conv_bufs[slot][l], c_drf.conv_state[l]->data,
+                        ckpt.conv_bytes[l], cudaMemcpyDeviceToDevice);
+    }
+}
+
+static void draft_ckpt_restore(const DraftCheckpoints & ckpt, TargetCache & c_drf, int slot) {
+    for (int l = 0; l < ckpt.n_delta; l++) {
+        cudaMemcpyAsync(c_drf.ssm_state[l]->data,  ckpt.ssm_bufs[slot][l],
+                        ckpt.ssm_bytes[l], cudaMemcpyDeviceToDevice);
+        cudaMemcpyAsync(c_drf.conv_state[l]->data, ckpt.conv_bufs[slot][l],
+                        ckpt.conv_bytes[l], cudaMemcpyDeviceToDevice);
+    }
+}
+
 // Full-attention KV compaction for DDTree sibling walks.
 //
 // The verify wrote each full-attn layer's K/V at DFS slots
@@ -1148,6 +1205,18 @@ int main(int argc, char ** argv) {
     long long n_ddtree_sibling_walks = 0;
     long long n_ddtree_sibling_commits = 0;
 
+    // Draft rollback checkpoints: one slot per draft step (0..N_spec), where
+    // slot 0 is pre-round baseline and slot i is post-step_drf i-1. Enabled
+    // whenever the draft has any delta-net layers (which is true for all
+    // qwen35-family drafts). Memory: ~N_spec * sum(layer ssm_state sizes).
+    DraftCheckpoints draft_ckpt{};
+    const bool use_draft_ckpt = (!c_drf.ssm_state.empty());
+    if (use_draft_ckpt) {
+        if (!draft_ckpt_alloc(draft_ckpt, c_drf, N_spec + 1)) {
+            std::fprintf(stderr, "draft_ckpt_alloc failed — falling back to sequential catch-up\n");
+        }
+    }
+
     auto t_start = std::chrono::steady_clock::now();
     while ((int)gen.size() < n_gen) {
         const int pre_pos = c_tgt.cur_pos;
@@ -1160,9 +1229,17 @@ int main(int argc, char ** argv) {
         snapshot_ssm_state(c_drf);
         snapshot_ssm_state(c_tgt);
 
+        // Draft baseline checkpoint (slot 0 = pre-round state). This is what
+        // we'd restore via the old snapshot+replay path; keeping a copy here
+        // lets fast-rollback reach commit_count==0 cleanly (just a memcpy).
+        if (use_draft_ckpt) draft_ckpt_save(draft_ckpt, c_drf, 0);
+
         // 1. Draft: N sequential forwards starting from last_tok.
         //    In DDTree mode we also capture per-position top-K log-probs from
-        //    the draft's full logits vector for tree-building.
+        //    the draft's full logits vector for tree-building. We also save
+        //    the draft's ssm+conv state to checkpoint slot i+1 after each
+        //    step — the fast-rollback path restores from checkpoint[commit]
+        //    instead of replaying commit_count step_drf forwards.
         const int L_ddtree = N_spec;
         std::vector<float>   ddtree_logp;
         std::vector<int32_t> ddtree_toks;
@@ -1174,6 +1251,7 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < N_spec; i++) {
             drafts[i] = step_drf(carry, pre_pos + i);
             c_drf.cur_pos = pre_pos + i + 1;
+            if (use_draft_ckpt) draft_ckpt_save(draft_ckpt, c_drf, i + 1);
             if (verify_mode == VERIFY_DDTREE) {
                 extract_draft_topk(logits_drf.data(), 1, (int)w_drf.embedder.n_vocab,
                                    ddtree_K,
@@ -1428,19 +1506,26 @@ int main(int argc, char ** argv) {
             }
             if (!fast_ok) catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
 
-            // Draft (0.8B, cheap): if accepted path == draft top-1 chain and
-            // commit_count <= N_spec, draft cache already embodies the right
-            // state at pre_pos + N_spec; rewind by snapshot restore + replay
-            // up to commit_count. The replay is fast at draft size.
-            // For the commit_count == N_spec + 1 case (full chain + bonus
-            // tip), draft only needs one extra step (feed drafts[N_spec-1]).
-            if (accepted_matches_chain && commit_count == N_spec + 1) {
+            // Draft rollback (0.8B).
+            //   - Chain-matched, commit_count in [0, N_spec]: slot commit_count
+            //     was saved during the draft loop — restore it in one memcpy.
+            //   - Chain-matched, commit_count == N_spec+1: extra step needed
+            //     (the N_spec'th draft was never actually processed; only its
+            //     argmax was captured). One step_model call.
+            //   - Sibling walk (DDTree only): checkpoints don't match the
+            //     accepted token sequence; fall back to sequential replay.
+            if (accepted_matches_chain && use_draft_ckpt && commit_count <= N_spec) {
+                draft_ckpt_restore(draft_ckpt, c_drf, commit_count);
+                c_drf.cur_pos = pre_pos + commit_count;
+            } else if (accepted_matches_chain && commit_count == N_spec + 1) {
+                if (use_draft_ckpt) {
+                    draft_ckpt_restore(draft_ckpt, c_drf, N_spec);
+                    c_drf.cur_pos = pre_pos + N_spec;
+                }
                 (void)step_model(w_drf, c_drf, backend, sg_drf,
                                  drafts[N_spec - 1], pre_pos + N_spec,
                                  embed_drf, logits_drf);
                 c_drf.cur_pos = pre_pos + N_spec + 1;
-            } else if (accepted_matches_chain && commit_count == N_spec) {
-                // Draft cache already at pre_pos + N_spec = pre_pos + commit_count.
             } else {
                 catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
             }
@@ -1455,8 +1540,42 @@ int main(int argc, char ** argv) {
             const bool tgt_needs_catchup =
                 use_batched_verify &&
                 (commit_count < N_spec || !accepted_matches_chain);
-            if (draft_needs_catchup) catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
-            if (tgt_needs_catchup)   catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
+
+            // Fast-path draft rollback via checkpoints — avoids replaying
+            // commit_count sequential step_drf forwards (~2 ms each at 0.8B).
+            if (draft_needs_catchup && accepted_matches_chain && use_draft_ckpt) {
+                draft_ckpt_restore(draft_ckpt, c_drf, commit_count);
+                c_drf.cur_pos = pre_pos + commit_count;
+            } else if (draft_needs_catchup) {
+                catch_up(w_drf, c_drf, sg_drf, embed_drf, logits_drf);
+            }
+
+            // Fast target rollback for tree_chain: its build_step_graph_tree
+            // captures ssm_intermediate per slot, same as DDTree. For chain
+            // mode the accepted DFS indices are [0..commit_count-1], so we
+            // construct that synthetic "accepted" path and reuse DDTree's
+            // fast rollback machinery. KV slots are already contiguous (chain
+            // walk), no compaction needed. Saves commit_count × 35B step_model
+            // calls (~5 ms each) per round, the dominant cost at 35B scale.
+            // Batch mode uses build_step_graph (no capture) so it still needs
+            // sequential catch-up.
+            bool fast_tgt_done = false;
+            if (tgt_needs_catchup && verify_mode == VERIFY_TREE_CHAIN
+                && accepted_matches_chain && commit_count > 0)
+            {
+                std::vector<int> synth_chain(commit_count);
+                for (int i = 0; i < commit_count; i++) synth_chain[i] = i;
+                DDTree dummy_tree;  // only parents[] is read for !walked_sibling branch
+                if (ddtree_fast_rollback_target(sg_tgt, c_tgt, synth_chain,
+                                                dummy_tree, commit_count,
+                                                /*walked_sibling=*/false)) {
+                    c_tgt.cur_pos = pre_pos + commit_count;
+                    fast_tgt_done = true;
+                }
+            }
+            if (tgt_needs_catchup && !fast_tgt_done) {
+                catch_up(w_tgt, c_tgt, sg_tgt, embed_tgt, logits_tgt);
+            }
         }
 
         last_tok = next_last_tok;

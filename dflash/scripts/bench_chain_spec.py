@@ -76,7 +76,12 @@ def run_ar(prompt_path: Path, n_gen: int) -> tuple[float, int]:
     dt = time.monotonic() - t0
     if r.returncode != 0:
         return 0.0, 0
-    # test_generate prints something like "... X.XX tok/s" on stdout.
+    # test_generate now prints TWO tok/s lines — the prefill rate and the
+    # decode rate. We want decode. The decode line is marked with "[gen]".
+    m = re.search(r"\[gen\][^\n]*?(\d+\.\d+)\s*tok/s", r.stdout)
+    if m:
+        return float(m.group(1)), 0
+    # Legacy single-line format (pre-prefill-batching).
     m = re.search(r"(\d+\.\d+)\s*tok/s", r.stdout)
     if m:
         return float(m.group(1)), 0
