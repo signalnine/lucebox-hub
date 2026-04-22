@@ -68,8 +68,10 @@ struct StepGraph {
     ggml_tensor *     parent_ids  = nullptr;   // tree-mode only
     ggml_tensor *     kv_pos_idx  = nullptr;   // i64 [n_tokens] for KV set_rows
     ggml_tensor *     logits      = nullptr;
+    ggml_tensor *     argmax      = nullptr;   // i32 [n_tokens] — GPU-side argmax
     int               n_tokens    = 0;
     int               n_kv_padded = 0;
+    bool              is_tree     = false;     // true = built by build_step_graph_tree
     // Tree-mode only: one entry per delta-net layer. Populated when
     // capture_delta_intermediate=true. Used by DDTree fast rollback.
     std::vector<dflash27b::DeltaNetCapture> delta_captures;
@@ -91,8 +93,10 @@ static void step_graph_free(StepGraph & sg) {
     sg.parent_ids  = nullptr;
     sg.kv_pos_idx  = nullptr;
     sg.logits      = nullptr;
+    sg.argmax      = nullptr;
     sg.n_tokens    = 0;
     sg.n_kv_padded = 0;
+    sg.is_tree     = false;
     sg.delta_captures.clear();
 }
 // Called at shutdown — fully tear down.
@@ -345,6 +349,17 @@ static bool build_step_graph(
     int kv_start,
     int n_tokens)
 {
+    // Same-shape reuse: see test_generate for rationale. If the graph is
+    // already built at this n_tokens + n_kv_padded shape, return early —
+    // ggml_reset + tensor-rebuild + gallocr walk costs ~280 µs/step.
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len       = kv_start + n_tokens;
+    const int want_n_kv_pd = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    if (sg.ctx && sg.gf && !sg.is_tree
+        && sg.n_tokens == n_tokens && sg.n_kv_padded == want_n_kv_pd) {
+        return true;
+    }
+
     step_graph_free(sg);
     if (!sg.ctx) {
         ggml_init_params ip{};
@@ -364,9 +379,7 @@ static bool build_step_graph(
     // across 256 steps, which is what ggml-cuda needs to reuse the captured
     // CUDA graph). q_pad matches KQ_MASK_PAD=32 for the fattn padded-q
     // convention.
-    constexpr int KV_PAD_ALIGN = 256;
-    const int kv_len     = kv_start + n_tokens;
-    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int n_kv_padded = want_n_kv_pd;
     const int q_pad      = align_up(n_tokens, KQ_MASK_PAD);
     sg.attn_mask  = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
     ggml_set_input(sg.attn_mask);
@@ -392,6 +405,15 @@ static bool build_step_graph(
     ggml_build_forward_expand(sg.gf, go.logits);
     sg.logits   = go.logits;
     sg.n_tokens = n_tokens;
+    sg.is_tree  = false;
+
+    // GPU-side argmax output. Saves ~200 µs/step on H2D copy + CPU argmax
+    // for the 248K-vocab logit head. Callers that need full logits (e.g.
+    // DDTree top-K extraction from the DRAFT) still read sg.logits; callers
+    // that only need argmax read sg.argmax.
+    sg.argmax = ggml_argmax(sg.ctx, go.logits);
+    ggml_set_output(sg.argmax);
+    ggml_build_forward_expand(sg.gf, sg.argmax);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -410,6 +432,14 @@ static bool build_step_graph_tree(
     int kv_start,
     int n_tokens)
 {
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len       = kv_start + n_tokens;
+    const int want_n_kv_pd = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    if (sg.ctx && sg.gf && sg.is_tree
+        && sg.n_tokens == n_tokens && sg.n_kv_padded == want_n_kv_pd) {
+        return true;
+    }
+
     step_graph_free(sg);
     if (!sg.ctx) {
         ggml_init_params ip{};
@@ -424,9 +454,7 @@ static bool build_step_graph_tree(
     ggml_set_input(sg.inp_embed);
     ggml_set_input(sg.positions);
 
-    constexpr int KV_PAD_ALIGN = 256;
-    const int kv_len      = kv_start + n_tokens;
-    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int n_kv_padded = want_n_kv_pd;
     const int q_pad       = align_up(n_tokens, KQ_MASK_PAD);
     sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
     ggml_set_input(sg.attn_mask);
@@ -458,6 +486,12 @@ static bool build_step_graph_tree(
     sg.logits         = go.logits;
     sg.delta_captures = std::move(go.delta_captures);
     sg.n_tokens       = n_tokens;
+    sg.is_tree        = true;
+
+    // GPU argmax per slot. sg.argmax has shape [n_tokens] i32.
+    sg.argmax = ggml_argmax(sg.ctx, go.logits);
+    ggml_set_output(sg.argmax);
+    ggml_build_forward_expand(sg.gf, sg.argmax);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -474,7 +508,8 @@ static int32_t step_model(
     StepGraph & sg,
     int32_t tok, int pos,
     std::vector<float> & embed_buf,
-    std::vector<float> & logits_buf)
+    std::vector<float> & logits_buf,
+    bool want_logits = false)  // true only when caller needs full logits
 {
     if (!build_step_graph(sg, w, cache, backend, pos, 1)) {
         std::fprintf(stderr, "build_step_graph(1) failed at pos=%d\n", pos);
@@ -509,6 +544,14 @@ static int32_t step_model(
         std::fprintf(stderr, "compute failed at pos=%d\n", pos); std::exit(1);
     }
     const int vocab = (int)w.embedder.n_vocab;
+    // Fast path: read GPU-computed argmax (4 bytes) instead of the 1 MiB
+    // logits vector. DDTree draft top-K extraction needs full logits, so
+    // those callers pass want_logits=true.
+    if (!want_logits) {
+        int32_t best_i32 = 0;
+        ggml_backend_tensor_get(sg.argmax, &best_i32, 0, sizeof(int32_t));
+        return (int)best_i32;
+    }
     if ((int)logits_buf.size() < vocab) logits_buf.assign(vocab, 0.f);
     ggml_backend_tensor_get(sg.logits, logits_buf.data(), 0, sizeof(float) * vocab);
     int best = 0; float bv = logits_buf[0];
@@ -617,7 +660,13 @@ static void verify_batch(
                     pos0_logits[11] - pos0_logits[13]);
     }
 
-    // Logits shape: [vocab, n_tokens]. Extract per-position argmax.
+    // GPU-side argmax per position: read n_tokens * 4 bytes instead of
+    // n_tokens * 248K * 4 bytes. Saves ~200 µs/step on the batch verify
+    // (multi-MiB H2D transfer for 35B's 248K-token vocab).
+    ggml_backend_tensor_get(sg.argmax, argmax_out, 0,
+                            sizeof(int32_t) * n_tokens);
+    return;
+    // (Unreachable old path preserved below for reference/debugging.)
     const int vocab = (int)w.embedder.n_vocab;
     const size_t nbytes = sizeof(float) * (size_t)vocab * (size_t)n_tokens;
     if (logits_buf.size() < (size_t)vocab * (size_t)n_tokens)
@@ -685,18 +734,10 @@ static void verify_tree(
     if (ggml_backend_graph_compute(backend, sg.gf) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "tree compute failed\n"); std::exit(1);
     }
-    const int vocab = (int)w.embedder.n_vocab;
-    if (logits_buf.size() < (size_t)vocab * n_tokens)
-        logits_buf.assign((size_t)vocab * n_tokens, 0.f);
-    ggml_backend_tensor_get(sg.logits, logits_buf.data(), 0,
-                            sizeof(float) * vocab * n_tokens);
-    for (int i = 0; i < n_tokens; i++) {
-        const float * row = logits_buf.data() + (size_t)i * vocab;
-        int best = 0; float bv = row[0];
-        for (int k = 1; k < vocab; k++)
-            if (row[k] > bv) { bv = row[k]; best = k; }
-        argmax_out[i] = best;
-    }
+    // GPU-side argmax per slot: sg.argmax has shape [n_tokens] i32. Skips
+    // the multi-MiB logits H2D transfer.
+    ggml_backend_tensor_get(sg.argmax, argmax_out, 0,
+                            sizeof(int32_t) * n_tokens);
 }
 
 // ─── Draft SSM/conv checkpoint ring ─────────────────────────────────────
@@ -1034,10 +1075,12 @@ int main(int argc, char ** argv) {
     StepGraph sg_tgt, sg_drf;
 
     auto step_tgt = [&](int32_t tok, int pos) {
-        return step_model(w_tgt, c_tgt, backend, sg_tgt, tok, pos, embed_tgt, logits_tgt);
+        return step_model(w_tgt, c_tgt, backend, sg_tgt, tok, pos, embed_tgt, logits_tgt,
+                          /*want_logits=*/false);
     };
-    auto step_drf = [&](int32_t tok, int pos) {
-        return step_model(w_drf, c_drf, backend, sg_drf, tok, pos, embed_drf, logits_drf);
+    auto step_drf = [&](int32_t tok, int pos, bool want_logits = false) {
+        return step_model(w_drf, c_drf, backend, sg_drf, tok, pos, embed_drf, logits_drf,
+                          want_logits);
     };
 
     // ── Minimal batched-verify diagnostic. BEFORE running any draft, run
@@ -1249,7 +1292,7 @@ int main(int argc, char ** argv) {
         }
         int32_t carry = last_tok;
         for (int i = 0; i < N_spec; i++) {
-            drafts[i] = step_drf(carry, pre_pos + i);
+            drafts[i] = step_drf(carry, pre_pos + i, /*want_logits=*/verify_mode == VERIFY_DDTREE);
             c_drf.cur_pos = pre_pos + i + 1;
             if (use_draft_ckpt) draft_ckpt_save(draft_ckpt, c_drf, i + 1);
             if (verify_mode == VERIFY_DDTREE) {
