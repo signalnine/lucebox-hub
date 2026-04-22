@@ -257,17 +257,19 @@ The initial M1b implementation prefilled one prompt token per target forward. Co
 
 Was 285 tok/s at M1b. The 1024-token chunk size amortises the per-chunk CUDA-graph capture over multiple kernel launches; each chunk's `mul_mat_q` tile utilises the MMQ batch path which is much faster per-token than the N=1 MMVQ kernel used during decode. Decode throughput is unaffected (prefill and decode use different CUDA graph cache slots, each with its own capture). Remaining prefill gap to llama.cpp is in upstream ggml-cuda (MMQ tile tuning; potential fused QKV for full-attn layers if the Q/K/V weights were pre-packed as they are on the 27B gguf).
 
-### Spec-decode on HumanEval + GSM8K (n=5, n_gen=256, N_spec=8)
+### Spec-decode on HumanEval + GSM8K + Math500 (n=5, n_gen=256, N_spec=8)
 
 With the 0.8B dense draft, after **GPU-argmax + graph-reuse** (`51ac916`+`f5f60b3`), fp32 ssm_intermediate (`c2ba531`), and DDTree sibling-walk partial draft rollback (`da6a499`):
 
-| Mode                      | HumanEval tok/s | HE AL  | HE ×AR   | GSM8K tok/s | GSM8K AL | GSM8K ×AR |
-|---------------------------|:---------------:|:------:|:--------:|:-----------:|:--------:|:---------:|
-| `test_generate` AR        | **233.63**      | —      | 1.00     | **234.32**  | —        | 1.00      |
-| `CHAIN_VERIFY=seq`        | 130.38          | 6.82   | 0.56     | 118.34      | 5.46     | 0.51      |
-| `CHAIN_VERIFY=batch`      | 191.68          | 7.37   | 0.82     | 138.51      | 5.68     | 0.59      |
-| `CHAIN_VERIFY=tree_chain` | **204.75**      | 6.64   | **0.88** | **172.28**  | 5.44     | **0.74**  |
-| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 153.65 | 7.64 | 0.66 | 142.43 | 6.96 | 0.61 |
+| Mode                      | HE tok/s   | HE ×AR   | GSM8K tok/s | GSM8K ×AR | Math500 tok/s | Math500 ×AR |
+|---------------------------|:----------:|:--------:|:-----------:|:---------:|:-------------:|:-----------:|
+| `test_generate` AR        | **233.63** | 1.00     | **234.32**  | 1.00      | **234.05**    | 1.00        |
+| `CHAIN_VERIFY=seq`        | 130.38     | 0.56     | 118.34      | 0.51      | 126.64        | 0.54        |
+| `CHAIN_VERIFY=batch`      | 191.68     | 0.82     | 138.51      | 0.59      | 156.91        | 0.67        |
+| `CHAIN_VERIFY=tree_chain` | **204.75** | **0.88** | **172.28**  | **0.74**  | **191.66**    | **0.82**    |
+| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 153.65 | 0.66 | 142.43 | 0.61 | 149.28 | 0.64 |
+
+(AL columns omitted for compactness; see `scripts/bench_*_reference.json` for per-mode AL.)
 
 **On specific low-drift prompts `tree_chain` BEATS AR.** Best cases in the bench:
 
@@ -275,6 +277,7 @@ With the 0.8B dense draft, after **GPU-argmax + graph-reuse** (`51ac916`+`f5f60b
 |----------------------|:--------:|:----------------:|:------:|:----:|
 | HE sample 3          | 233.72   | **247.48**       | +5.9%  | 8.37 |
 | GSM8K sample 1       | 234.22   | **248.46**       | +6.1%  | 8.20 |
+| Math500 sample 3     | 234.25   | **242.03**       | +3.3%  | 8.14 |
 
 Spec decode actually pays for itself once the draft-target AL is high enough to cover the per-round overhead. On GSM8K sample 5 the target/draft disagree on a near-tie (AL=3.13 for tree_chain), DDTree recovers via 23% sibling walks (AL=7.31, 151 tok/s — 55% faster than batch's 97.4).
 
