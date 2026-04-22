@@ -53,6 +53,8 @@ BENCHES = [
      lambda x: x["prompt"]),
     ("GSM8K",     "gsm8k",            "main",          "test",
      lambda x: f"Question: {x['question']}\nAnswer: "),
+    ("Math500",   "HuggingFaceH4/MATH-500", None,      "test",
+     lambda x: f"Problem: {x['problem']}\nSolution: "),
 ]
 
 
@@ -122,7 +124,7 @@ def run_chain(prompt_path: Path, n_gen: int, n_spec: int, mode: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", choices=["he", "gsm8k", "all"], default="all")
+    ap.add_argument("--dataset", choices=["he", "gsm8k", "math500", "all"], default="all")
     ap.add_argument("--modes", default="seq,batch,tree_chain,ddtree",
                     help="comma-separated verify modes")
     ap.add_argument("--n-sample", type=int, default=10)
@@ -151,6 +153,8 @@ def main():
         benches = [b for b in BENCHES if b[0] == "HumanEval"]
     elif args.dataset == "gsm8k":
         benches = [b for b in BENCHES if b[0] == "GSM8K"]
+    elif args.dataset == "math500":
+        benches = [b for b in BENCHES if b[0] == "Math500"]
     else:
         benches = BENCHES
 
