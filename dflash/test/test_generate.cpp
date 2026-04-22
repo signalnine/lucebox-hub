@@ -41,6 +41,8 @@ struct StepGraph {
     ggml_tensor *     kv_pos_idx = nullptr;   // i64 [n_tokens] row indices for KV set_rows
     ggml_tensor *     attn_mask  = nullptr;   // f16 [n_kv_padded, n_tokens_padded]
     ggml_tensor *     logits     = nullptr;
+    ggml_tensor *     argmax     = nullptr;   // i32 [n_tokens], argmax over vocab
+    int               n_tokens    = 0;
     int               n_kv_padded = 0;
 };
 
@@ -69,6 +71,18 @@ static bool build_step_graph(
     int kv_start,
     int n_tokens = 1
 ) {
+    // Fast path: if the graph already exists and the shape (n_tokens +
+    // n_kv_padded) matches, reuse it verbatim. The graph's op structure +
+    // tensor ne/nb are determined entirely by these two values; kv_start
+    // is an INPUT (kv_pos_idx tensor) that changes values only. This
+    // saves ~280 µs/step on graph teardown + rebuild + gallocr walk.
+    constexpr int KV_PAD_ALIGN = 256;
+    const int kv_len       = kv_start + n_tokens;
+    const int want_n_kv_pd = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    if (sg.ctx && sg.gf && sg.n_tokens == n_tokens && sg.n_kv_padded == want_n_kv_pd) {
+        return true;
+    }
+
     if (!sg.ctx) {
         ggml_init_params ip{};
         ip.mem_size   = 512 * 1024 * 1024;   // larger arena — batched prefill needs it
@@ -80,6 +94,7 @@ static bool build_step_graph(
         ggml_reset(sg.ctx);
     }
 
+    sg.n_tokens = n_tokens;
     const int hidden = w.n_embd;
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
@@ -94,9 +109,7 @@ static bool build_step_graph(
     // steps (ggml-cuda's CUDA-graph cache is invalidated on any property
     // change). 256-aligned pad matches llama.cpp's get_n_kv policy. The
     // attention mask matches: unused positions filled with -inf.
-    constexpr int KV_PAD_ALIGN = 256;
-    const int kv_len     = kv_start + n_tokens;
-    const int n_kv_padded = ((kv_len + KV_PAD_ALIGN - 1) / KV_PAD_ALIGN) * KV_PAD_ALIGN;
+    const int n_kv_padded = want_n_kv_pd;
     // q_pad must cover n_tokens AND align to fattn's 32-row expectation.
     const int q_pad      = ((n_tokens + 31) / 32) * 32;
     sg.attn_mask   = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, n_kv_padded, q_pad);
@@ -120,6 +133,14 @@ static bool build_step_graph(
     ggml_set_output(go.logits);
     ggml_build_forward_expand(sg.gf, go.logits);
     sg.logits = go.logits;
+
+    // GPU-side argmax over vocab per token. Returns an i32 [n_tokens] tensor.
+    // Reading a 4-byte int back per token instead of the full 248K-entry
+    // logits vector saves ~200 µs per decode step (the 1 MiB H2D copy) —
+    // one of the last non-kernel costs in the AR loop.
+    sg.argmax = ggml_argmax(sg.ctx, go.logits);
+    ggml_set_output(sg.argmax);
+    ggml_build_forward_expand(sg.gf, sg.argmax);
 
     if (!sg.alloc) {
         sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -263,17 +284,12 @@ int main(int argc, char ** argv) {
         }
         auto t4 = now_us();
 
-        // argmax on logits
-        const int vocab = (int)w.embedder.n_vocab;
-        std::vector<float> logits(vocab);
-        ggml_backend_tensor_get(sg.logits, logits.data(), 0, sizeof(float) * vocab);
+        // argmax — read 4-byte GPU-computed result instead of 1 MiB logits.
+        int32_t best_i32 = 0;
+        ggml_backend_tensor_get(sg.argmax, &best_i32, 0, sizeof(int32_t));
+        int best = (int)best_i32;
         auto t5 = now_us();
-        int best = 0;
-        float bv = logits[0];
-        for (int i = 1; i < vocab; i++) {
-            if (logits[i] > bv) { bv = logits[i]; best = i; }
-        }
-        auto t6 = now_us();
+        auto t6 = t5;  // argmax is now on GPU; CPU argmax pass eliminated.
         if (tt_enable) {
             tt_build   += std::chrono::duration<double, std::micro>(t1 - t0).count();
             tt_embed   += std::chrono::duration<double, std::micro>(t2 - t1).count();
@@ -351,19 +367,12 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "prefill compute failed (%d)\n", (int)st); std::exit(1);
         }
 
-        // Only need the LAST position's logits (to seed decode). Logits
-        // tensor shape is [vocab, chunk_n]; last row offset = (chunk_n-1)*vocab*4.
-        const int vocab = (int)w.embedder.n_vocab;
-        std::vector<float> last_logits(vocab);
-        const size_t row_off = (size_t)(chunk_n - 1) * vocab * sizeof(float);
-        ggml_backend_tensor_get(sg.logits, last_logits.data(), row_off,
-                                sizeof(float) * vocab);
-        int best = 0;
-        float bv = last_logits[0];
-        for (int i = 1; i < vocab; i++) {
-            if (last_logits[i] > bv) { bv = last_logits[i]; best = i; }
-        }
-        return best;
+        // Only need the LAST position's argmax (to seed decode). argmax is
+        // [chunk_n] i32; last entry is at offset (chunk_n-1)*4.
+        int32_t best_i32 = 0;
+        const size_t off = (size_t)(chunk_n - 1) * sizeof(int32_t);
+        ggml_backend_tensor_get(sg.argmax, &best_i32, off, sizeof(int32_t));
+        return (int)best_i32;
     };
 
     constexpr int PREFILL_CHUNK = 1024;
