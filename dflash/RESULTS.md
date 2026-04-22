@@ -289,6 +289,17 @@ AR decode 234 tok/s on 35B MXFP4 MoE **matches or slightly beats llama-bench tg2
 
 The chain_spec propagation of the last of those is the reason spec-decode modes jumped 50-90% from the pre-fast-rollback bench snapshot. DDTree sibling-walk partial checkpoint restore (`da6a499`) added another +3.5% on HE / +3.7% on GSM8K to DDTree by skipping draft forwards that the accepted path shares with the original chain — savings scale with `sibling_rate × sibling_d / commit_count`.
 
+**`N_spec` is mode-dependent** (5-sample sweep, HE / GSM8K / Math500):
+
+| Mode       | best `N_spec` | vs `N_spec=8`     |
+|------------|:-------------:|:-----------------:|
+| tree_chain |      6        | +1–5% (biggest on GSM8K where true AL ≈ 5.4) |
+| seq        |      6        | +3–6%             |
+| batch      |      6        | +3–6% on GSM8K / Math500; −12% on HE (noisy) |
+| ddtree     |      8        | DDTree loses 5–9% at `N_spec=6` because `N_spec` is the chain depth `L` — shrinking it wastes the `budget=22` tree budget on fewer paths |
+
+The current `N_spec=8` default stays because (a) DDTree regresses at smaller values and (b) for chain modes the gain is smaller than the DDTree loss. Users wanting max tree_chain throughput can pass `--n-spec 6`.
+
 ### Comparison — before vs after the cache-layout refactor
 
 Same driver, same prompts, same N_spec, same seed:
