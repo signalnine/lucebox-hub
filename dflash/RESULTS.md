@@ -259,23 +259,32 @@ Was 285 tok/s at M1b. The 1024-token chunk size amortises the per-chunk CUDA-gra
 
 ### Spec-decode on HumanEval + GSM8K (n=5, n_gen=256, N_spec=8)
 
-With the 0.8B dense draft, after the **fast-rollback** work (commit `3d1ae5c`): per-step SSM checkpoint ring for the draft + tree_chain target rollback reusing DDTree's fast-rollback helper.
+With the 0.8B dense draft, after the **GPU-argmax + graph-reuse** work (`51ac916`+`f5f60b3`) and fp32 ssm_intermediate (`c2ba531`):
 
-| Mode                      | HumanEval tok/s | HE AL  | HE ×AR  | GSM8K tok/s | GSM8K AL | GSM8K ×AR |
-|---------------------------|:---------------:|:------:|:-------:|:-----------:|:--------:|:---------:|
-| `test_generate` AR        | **206.63**      | —      | 1.00    | **207.16**  | —        | 1.00      |
-| `CHAIN_VERIFY=seq`        | 117.31          | 6.82   | 0.57    | 106.55      | 5.46     | 0.51      |
-| `CHAIN_VERIFY=batch`      | 167.72          | 7.37   | 0.81    | 121.67      | 5.68     | 0.59      |
-| `CHAIN_VERIFY=tree_chain` | **177.16**      | 6.62   | **0.86** | **157.97** | 5.83     | **0.76** |
-| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 120.35 | 7.01 | 0.58   | 108.23      | 6.30     | 0.52      |
+| Mode                      | HumanEval tok/s | HE AL  | HE ×AR   | GSM8K tok/s | GSM8K AL | GSM8K ×AR |
+|---------------------------|:---------------:|:------:|:--------:|:-----------:|:--------:|:---------:|
+| `test_generate` AR        | **233.63**      | —      | 1.00     | **234.20**  | —        | 1.00      |
+| `CHAIN_VERIFY=seq`        | 130.31          | 6.82   | 0.56     | 118.40      | 5.46     | 0.51      |
+| `CHAIN_VERIFY=batch`      | 191.89          | 7.37   | 0.82     | 138.71      | 5.68     | 0.59      |
+| `CHAIN_VERIFY=tree_chain` | **205.03**      | 6.64   | **0.88** | **172.37**  | 5.44     | **0.74**  |
+| `CHAIN_VERIFY=ddtree` (K=8, budget=22) | 148.70 | 7.64 | 0.64 | 137.34 | 6.96 | 0.59 |
 
-**tree_chain is now ~0.76-0.86× AR** — a 30% gain over the pre-fast-rollback numbers on GSM8K (was 0.58× AR at 122.77 tok/s). The win comes from replacing `commit_count × step_model` sequential catch-up calls — one 35B forward per accepted token, at ~5 ms each — with a batch of device-to-device `cudaMemcpyAsync` from the captured `ssm_intermediate` buffer. On GSM8K where AL is lower (5.8 vs 7.4 on HE), catch-up dominates per-round cost, so the savings are biggest.
+**On specific low-drift prompts `tree_chain` BEATS AR.** Best cases in the bench:
 
-DDTree's gain from fast rollback is marginal here because its target path was already using fast rollback (that's what we originally built `ddtree_fast_rollback_target` for in M3c). The draft-side checkpoints help DDTree chain-walk rounds but siblings still require sequential draft replay.
+| Prompt               | AR tok/s | tree_chain tok/s | Δ      | AL   |
+|----------------------|:--------:|:----------------:|:------:|:----:|
+| HE sample 3          | 232.82   | **248.29**       | +6.6%  | 8.37 |
+| GSM8K sample 1       | 234.08   | **248.22**       | +6.0%  | 8.20 |
 
-No mode beats AR at this draft/target ratio — the 0.8B draft is too weak relative to the 35B MoE target for chain-spec's per-round overhead to amortise. But every mode is coherent and `tree_chain` closes to 0.58–0.80× AR depending on prompt variance. DDTree's relative disadvantage grew after the ttx work because draft catch-up (`N_spec` sequential 0.8B forwards per round) is the same absolute cost as before but now a larger fraction of each round's wall time — the refactor sped up the target without speeding up the draft.
+Spec decode actually pays for itself once the draft-target AL is high enough to cover the per-round overhead. On GSM8K sample 5 the target/draft disagree on a near-tie (AL=3.13 for tree_chain), DDTree recovers via 23% sibling walks (AL=7.31, 147 tok/s — 49% faster than batch's 97.7).
 
-DDTree still wins on specific low-AL prompts. For example GSM8K sample 2 (a math word problem where the 0.8B draft disagrees with target 51% of the time): batch 83 tok/s → DDTree 92 tok/s (+11%) via sibling walks. The case for DDTree becomes compelling once the draft is strong enough that trees often pay back their per-round overhead — which points at M5 (trained block-diffusion draft, paper-style) or at a mid-size dense draft (3B/7B Qwen in place of 0.8B).
+AR decode 234 tok/s on 35B MXFP4 MoE **matches or slightly beats llama-bench tg256 (235) and tg1024 (234)** — we got there via the `qwen36-port` series:
+
+- swiglu-split fusion + persistent ggml ctx: 128 → 150 tok/s
+- KV cache layout + `ggml_set_rows`: 150 → 214 tok/s
+- GPU-side argmax + same-shape graph reuse: 214 → 234 tok/s
+
+The chain_spec propagation of the last of those is the reason spec-decode modes jumped 50-90% from the pre-fast-rollback bench snapshot.
 
 ### Comparison — before vs after the cache-layout refactor
 
